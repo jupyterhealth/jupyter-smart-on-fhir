@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jupyter-smart-on-fhir"
-version = "0.1.0a3"
+version = "0.1.0a4"
 description = "Jupyter Extension for SMART on FHIR launch"
 dynamic = ["readme"]
 keywords = ["Jupyter", "JupyterHub", "SMART", "FHIR"]
@@ -74,7 +74,7 @@ select = [
 github_url = "https://github.com/jupyterhealth/jupyter-smart-on-fhir"
 
 [tool.tbump.version]
-current = "0.1.0a3"
+current = "0.1.0a4"
 
 regex = '''
   (?P<major>\d+)
