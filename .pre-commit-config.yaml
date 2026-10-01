@@ -16,7 +16,7 @@ ci:
 repos:
   # autoformat and lint Python code
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: c59bba8fb259db0fec2bbb77ad8ba51ea7341b56 # frozen: v0.15.20
+    rev: 321478e58f4938179c6b86e4ddfa923d1547a49b # frozen: v0.16.6
     hooks:
       - id: ruff
         types_or:
@@ -36,13 +36,13 @@ repos:
 
   # Format toml
   - repo: https://github.com/ComPWA/taplo-pre-commit
-    rev: ade0f95ddcf661c697d4670d2cfcbe95d0048a0a # frozen: v0.9.3
+    rev: 23eab0f0eedcbedebff420f5fdfb284744adc7b3 # frozen: v0.9.3
     hooks:
       - id: taplo-format
 
   # github actions security checks
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: e3eebf65325ccc992422292cb7a4baee967cf815 # frozen: v1.26.1
+    rev: cef8b8350da46d8114c7e6b7272aebdccdf193ce # frozen: v1.30.0
     hooks:
       - id: zizmor
         args:
