@@ -13,7 +13,6 @@ from traitlets.config import Config
 
 from jupyter_smart_on_fhir import server_extension as ext
 from jupyter_smart_on_fhir import session as s
-from jupyter_smart_on_fhir.auth import SMARTConfig
 from jupyter_smart_on_fhir.server_extension import (
     SMARTCallbackHandler,
     SMARTIdentityProvider,
@@ -43,17 +42,14 @@ def jp_server_config(tmp_path):
 def fake_discovery(monkeypatch):
     calls = []
 
-    async def discover(iss, base_url, timeout):
+    async def fetch_discovery_document(iss, timeout):
         calls.append(iss)
-        return SMARTConfig(
-            base_url=base_url,
-            fhir_url=iss,
-            token_url="https://ehr.example/token",
-            auth_url="https://ehr.example/authorize",
-            smart_config={"token_endpoint": "https://ehr.example/token"},
-        )
+        return {
+            "token_endpoint": "https://ehr.example/token",
+            "authorization_endpoint": "https://ehr.example/authorize",
+        }
 
-    monkeypatch.setattr(ext, "discover", discover)
+    monkeypatch.setattr(ext, "fetch_discovery_document", fetch_discovery_document)
     return calls
 
 
@@ -62,8 +58,16 @@ def fake_token_exchange(monkeypatch):
     calls = []
 
     async def token_for_code(self, code, code_verifier, token_url):
-        calls.append({"code": code, "code_verifier": code_verifier, "token_url": token_url})
-        return {"access_token": f"AT-{code}", "token_type": "Bearer", "id_token": "IDT", "patient": "P1", "expires_in": 900}
+        calls.append(
+            {"code": code, "code_verifier": code_verifier, "token_url": token_url}
+        )
+        return {
+            "access_token": f"AT-{code}",
+            "token_type": "Bearer",
+            "id_token": "IDT",
+            "patient": "P1",
+            "expires_in": 900,
+        }
 
     monkeypatch.setattr(SMARTCallbackHandler, "token_for_code", token_for_code)
     return calls
@@ -77,7 +81,9 @@ def _clean_smart_token_env():
 
 def session_set_cookie(response) -> str:
     """The raw Set-Cookie header for the session cookie (Jupyter may set others)."""
-    hits = [h for h in response.headers.get_list("Set-Cookie") if h.startswith(f"{COOKIE}=")]
+    hits = [
+        h for h in response.headers.get_list("Set-Cookie") if h.startswith(f"{COOKIE}=")
+    ]
     assert len(hits) == 1, response.headers.get_list("Set-Cookie")
     return hits[0]
 
@@ -94,8 +100,10 @@ def store_of(jp_serverapp):
 
 async def launch(jp_fetch, iss=ISS, **extra):
     return await jp_fetch(
-        launch_path, params={"iss": iss, "launch": "L1", **extra},
-        follow_redirects=False, raise_error=False,
+        launch_path,
+        params={"iss": iss, "launch": "L1", **extra},
+        follow_redirects=False,
+        raise_error=False,
     )
 
 
@@ -124,7 +132,9 @@ async def test_launch_rejects_issuer_not_on_allowlist(jp_fetch, fake_discovery):
     assert not any(h.startswith(f"{COOKIE}=") for h in r.headers.get_list("Set-Cookie"))
 
 
-async def test_launch_matches_normalized_issuer_but_keeps_iss_as_sent(jp_fetch, jp_serverapp, fake_discovery):
+async def test_launch_matches_normalized_issuer_but_keeps_iss_as_sent(
+    jp_fetch, jp_serverapp, fake_discovery
+):
     # SMART: aud must equal the launch iss *as sent* (Medplum sends a trailing slash);
     # normalization is only for allowlist matching.
     raw = "https://EHR.example/fhir/"
@@ -138,10 +148,19 @@ async def test_launch_matches_normalized_issuer_but_keeps_iss_as_sent(jp_fetch, 
 async def test_launch_discovery_timeout_is_502(jp_fetch, monkeypatch):
     from tornado.httpclient import HTTPClientError
 
-    async def discover(iss, base_url, timeout):
+    async def fetch_discovery_document(iss, timeout):
         raise HTTPClientError(599, "Timeout")
 
-    monkeypatch.setattr(ext, "discover", discover)
+    monkeypatch.setattr(ext, "fetch_discovery_document", fetch_discovery_document)
+    r = await launch(jp_fetch)
+    assert r.code == 502
+
+
+async def test_launch_non_object_discovery_document_is_502(jp_fetch, monkeypatch):
+    async def fetch_discovery_document(iss, timeout):
+        return ["not", "an", "object"]
+
+    monkeypatch.setattr(ext, "fetch_discovery_document", fetch_discovery_document)
     r = await launch(jp_fetch)
     assert r.code == 502
 
@@ -150,8 +169,11 @@ async def test_relaunch_replaces_existing_session(jp_fetch, jp_serverapp):
     first = await launch(jp_fetch)
     first_sid = s.session_id_from_cookie_header(cookie_header(first))
     second = await jp_fetch(
-        launch_path, params={"iss": ISS, "launch": "L2"},
-        headers={"Cookie": cookie_header(first)}, follow_redirects=False, raise_error=False,
+        launch_path,
+        params={"iss": ISS, "launch": "L2"},
+        headers={"Cookie": cookie_header(first)},
+        follow_redirects=False,
+        raise_error=False,
     )
     second_sid = s.session_id_from_cookie_header(cookie_header(second))
     assert second_sid != first_sid
@@ -163,18 +185,40 @@ async def test_launch_at_capacity_evicts_oldest_and_still_works(jp_fetch, jp_ser
     store_of(jp_serverapp).max_pending = 1
     first = await launch(jp_fetch)
     second = await launch(jp_fetch)
-    assert first.code == 302 and second.code == 302  # anonymous floods never lock clinicians out
-    assert store_of(jp_serverapp).get(s.session_id_from_cookie_header(cookie_header(first))) is None
-    assert store_of(jp_serverapp).get(s.session_id_from_cookie_header(cookie_header(second))) is not None
+    assert (
+        first.code == 302 and second.code == 302
+    )  # anonymous floods never lock clinicians out
+    assert (
+        store_of(jp_serverapp).get(
+            s.session_id_from_cookie_header(cookie_header(first))
+        )
+        is None
+    )
+    assert (
+        store_of(jp_serverapp).get(
+            s.session_id_from_cookie_header(cookie_header(second))
+        )
+        is not None
+    )
 
 
-async def test_launch_discovery_is_cached_per_issuer(jp_fetch, fake_discovery):
+async def test_launch_discovery_is_cached_per_issuer(
+    jp_fetch, jp_serverapp, fake_discovery
+):
     assert (await launch(jp_fetch)).code == 302
-    assert (await launch(jp_fetch, iss=ISS + "/")).code == 302  # same issuer after normalization
+    second = await launch(jp_fetch, iss=ISS + "/")  # same issuer after normalization
+    assert second.code == 302
     assert fake_discovery == [ISS]  # one outbound discovery for both launches
+    # The cache holds the document only; aud/fhir_url stay this launch's iss as sent.
+    sess = store_of(jp_serverapp).get(
+        s.session_id_from_cookie_header(cookie_header(second))
+    )
+    assert sess.fhir_url == ISS + "/" and sess.smart_config.fhir_url == ISS + "/"
 
 
-async def test_settings_exported_for_kernels_and_startup_wipes_token_dir(jp_serverapp, tmp_path):
+async def test_settings_exported_for_kernels_and_startup_wipes_token_dir(
+    jp_serverapp, tmp_path
+):
     smart_auth = jp_serverapp.web_app.settings["smart_auth"]
     assert os.environ[s.TOKEN_DIR_ENV] == smart_auth.token_dir
     assert jp_serverapp.web_app.settings["smart_session_cookie_name"] == COOKIE

@@ -38,7 +38,7 @@ class FakeHandler:
 def test_https_cookie_is_secure_none_partitioned_httponly():
     h = FakeHandler("https")
     ext.set_session_cookie(h, "x" * 32)
-    (_, header), = h.headers
+    ((_, header),) = h.headers
     assert header.startswith("smart-session=")
     assert "HttpOnly" in header and "Secure" in header and "SameSite=None" in header
     assert header.endswith("; Partitioned")
@@ -48,8 +48,12 @@ def test_https_cookie_is_secure_none_partitioned_httponly():
 def test_http_cookie_is_lax_without_secure_or_partitioned():
     h = FakeHandler("http")
     ext.set_session_cookie(h, "x" * 32)
-    (_, header), = h.headers
-    assert "SameSite=Lax" in header and "Secure" not in header and "Partitioned" not in header
+    ((_, header),) = h.headers
+    assert (
+        "SameSite=Lax" in header
+        and "Secure" not in header
+        and "Partitioned" not in header
+    )
 
 
 def test_forced_secure_and_partitioned_off():
@@ -58,17 +62,33 @@ def test_forced_secure_and_partitioned_off():
     auth.cookie_partitioned = False
     h = FakeHandler("http", auth)
     ext.set_session_cookie(h, "x" * 32)
-    (_, header), = h.headers
-    assert "Secure" in header and "SameSite=None" in header and "Partitioned" not in header
+    ((_, header),) = h.headers
+    assert (
+        "Secure" in header and "SameSite=None" in header and "Partitioned" not in header
+    )
 
 
 def test_normalize_issuer():
-    assert ext.normalize_issuer(" HTTPS://EHR.Example/fhir/R4/ ") == "https://ehr.example/fhir/R4"
-    assert ext.normalize_issuer("http://localhost:8103/fhir/R4") == "http://localhost:8103/fhir/R4"
+    assert (
+        ext.normalize_issuer(" HTTPS://EHR.Example/fhir/R4/ ")
+        == "https://ehr.example/fhir/R4"
+    )
+    assert (
+        ext.normalize_issuer("http://localhost:8103/fhir/R4")
+        == "http://localhost:8103/fhir/R4"
+    )
     with pytest.raises(ValueError):
         ext.normalize_issuer("http://ehr.example/fhir")  # plain http only for localhost
     with pytest.raises(ValueError):
         ext.normalize_issuer("ehr.example/fhir")
+    with pytest.raises(ValueError):
+        ext.normalize_issuer(
+            "https://ehr.exa\tmple/fhir"
+        )  # urlparse would drop the tab
+    with pytest.raises(ValueError):
+        ext.normalize_issuer(
+            "https://\u212aehr.example/fhir"
+        )  # Kelvin sign folds to "k"
 
 
 def test_check_standalone_config_requires_allowlist():

@@ -257,10 +257,16 @@ class SMARTIdentityProvider(IdentityProvider):
 def normalize_issuer(url: str) -> str:
     """Canonical form for allowlist matching: lower-case scheme+host, no trailing slash,
     https required except for localhost development."""
+    # urlparse silently drops tabs/newlines, so reject them before parsing.
+    if any(c in (url or "") for c in "\t\r\n"):
+        raise ValueError(f"issuer contains control characters: {url!r}")
     url = (url or "").strip().rstrip("/")
     parts = urlparse(url)
     if not parts.scheme or not parts.netloc:
         raise ValueError(f"issuer must be an absolute URL: {url!r}")
+    # Non-ASCII hosts can case-fold onto ASCII ones (Kelvin sign -> "k").
+    if not parts.netloc.isascii():
+        raise ValueError(f"issuer host must be ASCII: {url!r}")
     scheme, netloc = parts.scheme.lower(), parts.netloc.lower()
     host = netloc.rsplit("@", 1)[-1].split(":", 1)[0]
     if scheme != "https" and host not in ("localhost", "127.0.0.1"):
@@ -281,16 +287,19 @@ def check_standalone_config(allowed_issuers: set, identity_provider_class) -> No
         )
 
 
-async def discover(iss: str, base_url: str, timeout: float) -> SMARTConfig:
-    """Async SMART discovery (the launch handler runs on the event loop; never block it).
-    `iss` is kept as the EHR sent it: SMART requires `aud` to equal that value."""
+async def fetch_discovery_document(iss: str, timeout: float) -> dict:
+    """Async fetch of the issuer's .well-known/smart-configuration (never block the loop)."""
     reply = await AsyncHTTPClient().fetch(
         f"{iss.rstrip('/')}/{SMARTConfig.broadcast_path}",
         headers={"Accept": "application/json"},
         request_timeout=timeout,
         follow_redirects=False,
     )
-    cfg = json.loads(reply.body.decode("utf8", "replace"))
+    return json.loads(reply.body.decode("utf8", "replace"))
+
+
+def config_from_document(cfg: dict, iss: str, base_url: str) -> SMARTConfig:
+    """`iss` is kept as this launch sent it: SMART requires `aud` to equal that value."""
     return SMARTConfig(
         base_url=base_url,
         fhir_url=iss,
@@ -300,19 +309,30 @@ async def discover(iss: str, base_url: str, timeout: float) -> SMARTConfig:
     )
 
 
+async def discover(iss: str, base_url: str, timeout: float) -> SMARTConfig:
+    """Async SMART discovery for one launch."""
+    return config_from_document(
+        await fetch_discovery_document(iss, timeout), iss, base_url
+    )
+
+
 async def cached_discover(handler, fhir_url: str, normalized: str) -> SMARTConfig:
-    """Discovery result per normalized issuer, reused for discovery_cache_ttl seconds."""
+    """SMARTConfig for this launch; the discovery document is reused per normalized
+    issuer for discovery_cache_ttl seconds."""
     smart_auth = handler.settings["smart_auth"]
     cache = handler.settings["smart_discovery_cache"]
     store = handler.settings["smart_session_store"]
     now = store.clock()
     hit = cache.get(normalized)
-    if hit and hit[0] > now:
-        return hit[1]
-    config = await discover(
-        fhir_url, handler.request.full_url(), smart_auth.discovery_timeout
-    )
-    cache[normalized] = (now + smart_auth.discovery_cache_ttl, config)
+    fresh = hit is not None and hit[0] > now
+    if fresh:
+        cfg = hit[1]
+    else:
+        cfg = await fetch_discovery_document(fhir_url, smart_auth.discovery_timeout)
+    # Cache only the (usable) document: aud must be each launch's own iss, not the first's.
+    config = config_from_document(cfg, fhir_url, handler.request.full_url())
+    if not fresh:
+        cache[normalized] = (now + smart_auth.discovery_cache_ttl, cfg)
     return config
 
 
@@ -440,7 +460,7 @@ class SMARTLaunchHandler(JupyterHandler):
             raise web.HTTPError(400, NOT_ALLOWED_ISSUER_MESSAGE)
         try:
             smart_config = await cached_discover(self, fhir_url, normalized)
-        except (HTTPClientError, OSError, KeyError, ValueError) as e:
+        except (HTTPClientError, OSError, KeyError, TypeError, ValueError) as e:
             self.log.error("SMART discovery failed for %s: %s", fhir_url, e)
             raise web.HTTPError(502, "Could not read the EHR's SMART configuration")
         # A launch always starts a new session (defeats session fixation); drop any old one.
