@@ -160,3 +160,88 @@ def test_unknown_session_raises_on_mutation(store):
 def test_token_file_rejects_unsafe_ids(store):
     with pytest.raises(s.SMARTSessionError):
         store.token_file("../etc/passwd")
+
+
+import base64 as _b64
+
+NAME = "smart-session"
+
+
+def _signed(value, name=NAME):
+    # tornado v2 signed-value layout; the signature field is irrelevant to the parser
+    b = _b64.b64encode(value.encode()).decode()
+    return f"2|1:0|10:1700000000|{len(name)}:{name}|{len(b)}:{b}|deadbeef"
+
+
+def test_parse_cookie_header_is_lenient_like_tornado():
+    header = 'ga={"a":1}; weird value=x y; smart-session="quoted=value"; last=1'
+    jar = s.parse_cookie_header(header)
+    assert jar["smart-session"] == "quoted=value"
+    assert jar["last"] == "1"
+    assert s.parse_cookie_header(None) == {} and s.parse_cookie_header("") == {}
+
+
+def test_parse_cookie_header_refuses_duplicate_names():
+    # tornado keeps the LAST value, a naive parser the FIRST: a crafted header could steer
+    # a kernel to another session, so any duplicate name is treated as no cookies at all.
+    assert s.parse_cookie_header("smart-session=a; x=1; smart-session=b") is None
+    assert s.session_id_from_cookie_header("smart-session=a; smart-session=b") is None
+
+
+def test_session_id_from_signed_value_requires_v2_and_matching_name():
+    sid = "b" * 32
+    assert s.session_id_from_signed_value(_signed(sid), NAME) == sid
+    assert s.session_id_from_signed_value(_signed(sid, name="other"), NAME) is None
+    assert (
+        s.session_id_from_signed_value(sid, NAME) is None
+    )  # bare ids are not accepted
+    assert s.session_id_from_signed_value("2|1:0|bad", NAME) is None
+    assert s.session_id_from_signed_value(_signed("../x"), NAME) is None
+
+
+def test_session_id_from_cookie_header_picks_named_cookie_after_malformed_sibling():
+    sid = "c" * 32
+    header = f'ga={{"a":1}}; _xsrf=123; smart-session="{_signed(sid)}"; other=1'
+    assert s.session_id_from_cookie_header(header) == sid
+    assert s.session_id_from_cookie_header(header, cookie_name="nope") is None
+    assert s.session_id_from_cookie_header(None) is None
+
+
+def test_load_token_reads_this_sessions_file(tmp_path):
+    sid = "d" * 32
+    (tmp_path / f"{sid}.json").write_text(
+        json.dumps({"token": {"access_token": "AT"}, "expires_at": 2_000_000})
+    )
+    env = {
+        s.TOKEN_DIR_ENV: str(tmp_path),
+        s.COOKIE_HEADER_ENV: f"smart-session={_signed(sid)}",
+    }
+    assert s.load_token(env, now=lambda: 1_000_000)["token"]["access_token"] == "AT"
+
+
+def test_load_token_rejects_expired_file(tmp_path):
+    sid = "f" * 32
+    (tmp_path / f"{sid}.json").write_text(
+        json.dumps({"token": {"access_token": "AT"}, "expires_at": 1_000})
+    )
+    env = {
+        s.TOKEN_DIR_ENV: str(tmp_path),
+        s.COOKIE_HEADER_ENV: f"smart-session={_signed(sid)}",
+    }
+    with pytest.raises(s.SMARTSessionError, match="expired"):
+        s.load_token(env, now=lambda: 2_000)
+
+
+def test_load_token_errors_are_actionable(tmp_path):
+    with pytest.raises(s.SMARTSessionError, match="SMART_TOKEN_DIR"):
+        s.load_token({})
+    with pytest.raises(s.SMARTSessionError, match="http_header_envs"):
+        s.load_token({s.TOKEN_DIR_ENV: str(tmp_path)})
+    sid = "e" * 32
+    with pytest.raises(s.SMARTSessionError, match="expired or not launched"):
+        s.load_token(
+            {
+                s.TOKEN_DIR_ENV: str(tmp_path),
+                s.COOKIE_HEADER_ENV: f"smart-session={_signed(sid)}",
+            }
+        )
