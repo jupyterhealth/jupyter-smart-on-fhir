@@ -18,6 +18,7 @@ from traitlets import Bool, Callable, Int, List, Unicode, default
 
 from jupyter_smart_on_fhir.auth import SMARTConfig, generate_state
 from jupyter_smart_on_fhir.session import (
+    COOKIE_NAME_ENV,
     SESSION_COOKIE_NAME,
     TOKEN_DIR_ENV,
     SMARTSession,
@@ -187,7 +188,13 @@ class SMARTExtensionApp(ExtensionApp):
 
     def initialize_settings(self):
         allowed = {normalize_issuer(u) for u in self.allowed_issuers if u.strip()}
-        check_standalone_config(allowed, self.serverapp.identity_provider_class)
+        check_standalone_config(
+            allowed,
+            self.serverapp.identity_provider_class,
+            self.serverapp.authorizer_class,
+            getattr(self.serverapp.kernel_manager, "allowed_message_types", None),
+            self.log,
+        )
         store = SMARTSessionStore(
             self.token_dir,
             pending_lifetime=self.pending_lifetime,
@@ -196,6 +203,7 @@ class SMARTExtensionApp(ExtensionApp):
         )
         store.wipe()  # no session survives a restart
         os.environ[TOKEN_DIR_ENV] = self.token_dir
+        os.environ[COOKIE_NAME_ENV] = self.cookie_name
         self.settings["smart_auth"] = self
         self.settings["smart_session_store"] = store
         self.settings["smart_session_cookie_name"] = self.cookie_name
@@ -275,16 +283,41 @@ def normalize_issuer(url: str) -> str:
     return parts._replace(scheme=scheme, netloc=netloc).geturl()
 
 
-def check_standalone_config(allowed_issuers: set, identity_provider_class) -> None:
-    """Standalone mode has no other gate, so an empty allowlist would mean 'trust any EHR'."""
-    if (
+def check_standalone_config(
+    allowed_issuers: set,
+    identity_provider_class,
+    authorizer_class=None,
+    allowed_message_types=None,
+    log=None,
+) -> None:
+    """Standalone mode has no other gate: refuse an empty allowlist ('trust any EHR') or
+    a non-SMART authorizer, and warn when sessions may execute code in their kernel."""
+    if not (
         isinstance(identity_provider_class, type)
         and issubclass(identity_provider_class, SMARTIdentityProvider)
-        and not allowed_issuers
     ):
+        return
+    if not allowed_issuers:
         raise ValueError(
             "SMARTExtensionApp.allowed_issuers must list at least one EHR issuer "
             "when ServerApp.identity_provider_class is SMARTIdentityProvider"
+        )
+    if authorizer_class is not None and not (
+        isinstance(authorizer_class, type)
+        and issubclass(authorizer_class, SMARTAuthorizer)
+    ):
+        raise ValueError(
+            "standalone mode requires ServerApp.authorizer_class = SMARTAuthorizer: "
+            "a session could otherwise start kernels and run code"
+        )
+    if (
+        log is not None
+        and allowed_message_types is not None
+        and not allowed_message_types
+    ):
+        log.warning(
+            "MappingKernelManager.allowed_message_types is empty: sessions can send "
+            "execute_request; set the comm-only list"
         )
 
 
@@ -307,13 +340,6 @@ def config_from_document(cfg: dict, iss: str, base_url: str) -> SMARTConfig:
         token_url=cfg["token_endpoint"],
         auth_url=cfg["authorization_endpoint"],
         smart_config=cfg,
-    )
-
-
-async def discover(iss: str, base_url: str, timeout: float) -> SMARTConfig:
-    """Async SMART discovery for one launch."""
-    return config_from_document(
-        await fetch_discovery_document(iss, timeout), iss, base_url
     )
 
 
@@ -387,9 +413,9 @@ def resolve_session(handler) -> tuple[SMARTSession | None, str]:
     name = handler.settings.get("smart_session_cookie_name")
     if store is None or not name:
         return None, "no-cookie"
-    jar = parse_cookie_header(handler.request.headers.get("Cookie"))
+    jar = parse_cookie_header(handler.request.headers.get("Cookie"), unique_name=name)
     if jar is None:
-        # tornado would verify the LAST value while a kernel might read the FIRST; refuse.
+        # Session cookie sent twice: tornado verifies the LAST, a kernel might read the FIRST.
         return None, "duplicate-cookie"
     if name not in jar:
         return None, "no-cookie"
@@ -468,9 +494,8 @@ class SMARTLaunchHandler(JupyterHandler):
         old, _ = resolve_session(self)
         if old is not None:
             store.delete(old.session_id)
-        session = store.create(
-            fhir_url, smart_config
-        )  # evicts the oldest pending at capacity
+        # evicts the oldest pending at capacity
+        session = store.create(fhir_url, smart_config)
         set_session_cookie(self, session.session_id)
         self.log.info(
             "Starting smart launch %s for %s", session.session_id[:8], fhir_url
@@ -594,9 +619,13 @@ class SMARTCallbackHandler(JupyterHandler):
         if not code:
             raise web.HTTPError(400, "Error: no code in response from FHIR server")
 
+        # Consume state before awaiting: a concurrent replay must not reach the EHR too.
+        code_verifier = session.code_verifier
+        session.state_id = None
+        session.code_verifier = None
         try:
             token_response = await self.token_for_code(
-                code, session.code_verifier, session.smart_config.token_url
+                code, code_verifier, session.smart_config.token_url
             )
             session = store.complete(session.session_id, token_response)
         except (HTTPClientError, OSError, SMARTSessionError) as e:
@@ -666,6 +695,9 @@ class SMARTSessionInfoHandler(JupyterHandler):
     @web.authenticated
     def get(self):
         session, _ = resolve_session(self)
+        if session is None:
+            # Hub/default provider: a logged-in user need not hold a SMART session.
+            raise web.HTTPError(403)
         self.set_header("Content-Type", "application/json")
         self.finish(
             json.dumps(

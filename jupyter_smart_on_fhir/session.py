@@ -2,7 +2,7 @@
 
 OAuth state, the PKCE verifier and the token are keyed by a session id that lives in a
 signed cookie. This module has no tornado/requests imports so notebook kernels can use
-the read-side helpers (added at the bottom of the file in a later task).
+the read-side helpers at the bottom of the file.
 """
 
 from __future__ import annotations
@@ -20,12 +20,13 @@ from typing import Any
 
 SESSION_COOKIE_NAME = "smart-session"
 TOKEN_DIR_ENV = "SMART_TOKEN_DIR"
+COOKIE_NAME_ENV = "SMART_COOKIE_NAME"
 COOKIE_HEADER_ENV = "HTTP_COOKIE"
 SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 class SMARTSessionError(Exception):
-    """Raised when a session is unknown, expired, over capacity, or unresolvable in a kernel."""
+    """Raised when a session is unknown or expired, or unresolvable in a kernel."""
 
 
 @dataclass
@@ -69,7 +70,7 @@ class SMARTSessionStore:
             (sess for sess in self._sessions.values() if sess.token is None),
             key=lambda sess: sess.created,
         )
-        while len(pending) >= self.max_pending:
+        while pending and len(pending) >= max(self.max_pending, 1):
             self.delete(pending.pop(0).session_id)
         now = self.clock()
         sess = SMARTSession(
@@ -149,9 +150,12 @@ class SMARTSessionStore:
     def wipe(self) -> None:
         """Remove every token file on disk (server startup: no session survives a restart)."""
         self._sessions.clear()
-        for pattern in ("*.json", ".*.tmp"):  # .tmp: a write cut short by a crash
-            for path in self.token_dir.glob(pattern):
-                path.unlink()
+        for path in self.token_dir.iterdir():
+            # Only our own files: <id>.json, or .<id>.<hex>.tmp from a write cut short by a crash.
+            if not path.is_file() or path.is_symlink():
+                continue
+            if _is_token_file_name(path.name):
+                path.unlink(missing_ok=True)
 
     def token_file(self, session_id: str) -> Path:
         if not SAFE_SESSION_ID.match(session_id or ""):
@@ -178,14 +182,28 @@ class SMARTSessionStore:
             raise
 
 
+_TMP_FILE_NAME = re.compile(r"^\.([A-Za-z0-9_-]{16,128})\.[0-9a-f]+\.tmp$")
+
+
+def _is_token_file_name(name: str) -> bool:
+    if name.endswith(".json"):
+        return bool(SAFE_SESSION_ID.match(name[: -len(".json")]))
+    return bool(_TMP_FILE_NAME.match(name))
+
+
 # --- kernel-side helpers (no server objects available here) -------------------------
 
 
-def parse_cookie_header(header: str | None) -> dict[str, str] | None:
+def parse_cookie_header(
+    header: str | None, unique_name: str | None = None
+) -> dict[str, str] | None:
     """Lenient Cookie-header parse matching tornado.httputil.parse_cookie: a malformed
     sibling cookie must not hide the session cookie (http.cookies.SimpleCookie would).
-    Returns None if any name appears more than once: tornado keeps the last value and a
-    naive reader the first, and that disagreement is exploitable, so refuse outright."""
+
+    Returns None if `unique_name` appears more than once: tornado keeps the last value
+    and a naive reader the first, and for the session cookie that disagreement is
+    exploitable, so refuse outright. Any other repeated name keeps its FIRST value here
+    (tornado keeps the last); only the session cookie's uniqueness matters."""
     jar: dict[str, str] = {}
     if not header:
         return jar
@@ -197,7 +215,9 @@ def parse_cookie_header(header: str | None) -> dict[str, str] | None:
         if not key:
             continue
         if key in jar:
-            return None
+            if key == unique_name:
+                return None
+            continue
         if len(val) >= 2 and val[0] == val[-1] == '"':
             val = val[1:-1].replace('\\"', '"').replace("\\\\", "\\")
         jar[key] = val
@@ -232,7 +252,7 @@ def session_id_from_signed_value(value: str | None, cookie_name: str) -> str | N
 def session_id_from_cookie_header(
     header: str | None, cookie_name: str = SESSION_COOKIE_NAME
 ) -> str | None:
-    jar = parse_cookie_header(header)
+    jar = parse_cookie_header(header, unique_name=cookie_name)
     if not jar:
         return None
     return session_id_from_signed_value(jar.get(cookie_name), cookie_name)
@@ -245,7 +265,9 @@ def current_token_file(env: Mapping[str, str] | None = None) -> Path:
         raise SMARTSessionError(
             f"{TOKEN_DIR_ENV} is not set; is the jupyter_smart_on_fhir server extension loaded?"
         )
-    sid = session_id_from_cookie_header(env.get(COOKIE_HEADER_ENV))
+    sid = session_id_from_cookie_header(
+        env.get(COOKIE_HEADER_ENV), env.get(COOKIE_NAME_ENV, SESSION_COOKIE_NAME)
+    )
     if not sid:
         raise SMARTSessionError(
             "No SMART session cookie reached this kernel. Set "

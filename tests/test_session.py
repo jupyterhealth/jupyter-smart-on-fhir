@@ -59,6 +59,13 @@ def test_create_evicts_oldest_pending_at_cap(tmp_path, clock):
     assert store.get(b.session_id) is b and store.get(c.session_id) is c
 
 
+def test_create_with_zero_max_pending_still_creates(tmp_path, clock):
+    store = s.SMARTSessionStore(tmp_path / "sessions", max_pending=0, clock=clock)
+    a = store.create("https://ehr.example/fhir", FakeSmartConfig())
+    b = store.create("https://ehr.example/fhir", FakeSmartConfig())
+    assert store.get(a.session_id) is None and store.get(b.session_id) is b
+
+
 def test_eviction_never_touches_authenticated_sessions(tmp_path, clock):
     store = s.SMARTSessionStore(tmp_path / "sessions", max_pending=1, clock=clock)
     done = store.create("https://ehr.example/fhir", FakeSmartConfig())
@@ -169,6 +176,19 @@ def test_wipe_removes_stale_files_from_disk(tmp_path, clock):
     assert list(d.iterdir()) == []
 
 
+def test_wipe_removes_only_session_files(tmp_path, clock):
+    d = tmp_path / "sessions"
+    d.mkdir()
+    sid = "s" * 32
+    (d / "dir.json").mkdir()
+    (d / "other.json").write_text("{}")
+    (d / f"{sid}.json").write_text("{}")
+    (d / f".{sid}.abcd.tmp").write_text("{}")
+    store = s.SMARTSessionStore(d, clock=clock)
+    store.wipe()
+    assert sorted(p.name for p in d.iterdir()) == ["dir.json", "other.json"]
+
+
 def test_unknown_session_raises_on_mutation(store):
     with pytest.raises(s.SMARTSessionError):
         store.set_oauth_state("nope", {"state_id": "S", "code_verifier": "V"})
@@ -202,9 +222,18 @@ def test_parse_cookie_header_is_lenient_like_tornado():
 
 def test_parse_cookie_header_refuses_duplicate_names():
     # tornado keeps the LAST value, a naive parser the FIRST: a crafted header could steer
-    # a kernel to another session, so any duplicate name is treated as no cookies at all.
-    assert s.parse_cookie_header("smart-session=a; x=1; smart-session=b") is None
+    # a kernel to another session, so a repeated session cookie means no cookies at all.
+    header = "smart-session=a; x=1; smart-session=b"
+    assert s.parse_cookie_header(header, unique_name="smart-session") is None
+    assert s.parse_cookie_header(header)["smart-session"] == "a"
     assert s.session_id_from_cookie_header("smart-session=a; smart-session=b") is None
+
+
+def test_duplicate_unrelated_cookie_does_not_hide_the_session():
+    sid = "a" * 32
+    header = f"_ga=1; _ga=2; smart-session={_signed(sid)}"
+    assert s.parse_cookie_header(header, unique_name="smart-session")["_ga"] == "1"
+    assert s.session_id_from_cookie_header(header) == sid
 
 
 def test_session_id_from_signed_value_requires_v2_and_matching_name():
@@ -234,6 +263,19 @@ def test_load_token_reads_this_sessions_file(tmp_path):
     env = {
         s.TOKEN_DIR_ENV: str(tmp_path),
         s.COOKIE_HEADER_ENV: f"smart-session={_signed(sid)}",
+    }
+    assert s.load_token(env, now=lambda: 1_000_000)["token"]["access_token"] == "AT"
+
+
+def test_load_token_uses_exported_cookie_name(tmp_path):
+    sid = "g" * 32
+    (tmp_path / f"{sid}.json").write_text(
+        json.dumps({"token": {"access_token": "AT"}, "expires_at": 2_000_000})
+    )
+    env = {
+        s.TOKEN_DIR_ENV: str(tmp_path),
+        s.COOKIE_NAME_ENV: "custom",
+        s.COOKIE_HEADER_ENV: f"custom={_signed(sid, name='custom')}",
     }
     assert s.load_token(env, now=lambda: 1_000_000)["token"]["access_token"] == "AT"
 

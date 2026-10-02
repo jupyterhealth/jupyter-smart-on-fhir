@@ -2,8 +2,6 @@
 them (SMARTIdentityProvider, allow_unauthenticated_access=False). Discovery and the
 token exchange are faked; no SMART sandbox."""
 
-# NOTE: this header has only what Tasks 4 uses; Task 5 adds `parse_qsl`, Task 6 adds
-# `json` and `callback_path` (ruff --fix strips unused imports at each commit).
 import json
 import os
 from http.cookies import SimpleCookie
@@ -15,6 +13,7 @@ from traitlets.config import Config
 from jupyter_smart_on_fhir import server_extension as ext
 from jupyter_smart_on_fhir import session as s
 from jupyter_smart_on_fhir.server_extension import (
+    SMARTAuthorizer,
     SMARTCallbackHandler,
     SMARTIdentityProvider,
     callback_path,
@@ -31,12 +30,16 @@ def jp_server_config(tmp_path):
     c = Config()
     c.ServerApp.jpserver_extensions = {"jupyter_smart_on_fhir.server_extension": True}
     c.ServerApp.identity_provider_class = SMARTIdentityProvider
+    c.ServerApp.authorizer_class = SMARTAuthorizer
     c.ServerApp.allow_unauthenticated_access = False
     c.ServerApp.disable_check_xsrf = True
     c.SMARTExtensionApp.client_id = "client-123"
     c.SMARTExtensionApp.allowed_issuers = [ISS]
     c.SMARTExtensionApp.token_dir = str(tmp_path / "sessions")
     c.SMARTExtensionApp.token_file = str(tmp_path / "legacy.json")
+    # a leftover from a previous run, so the startup-wipe assertion means something
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / ("s" * 32 + ".json")).write_text("{}")
     return c
 
 
@@ -226,6 +229,7 @@ async def test_settings_exported_for_kernels_and_startup_wipes_token_dir(
     assert jp_serverapp.web_app.settings["smart_session_cookie_name"] == COOKIE
     assert jp_serverapp.web_app.settings["smart_allowed_issuers"] == {ISS}
     assert jp_serverapp.web_app.settings["smart_discovery_cache"] == {}
+    assert os.environ[s.COOKIE_NAME_ENV] == COOKIE
     assert list(os.scandir(smart_auth.token_dir)) == []
 
 
@@ -486,7 +490,8 @@ async def test_callback_token_file_write_failure_is_502_and_session_stays_pendin
     r = await do_callback(jp_fetch, l, lg)
     assert r.code == 502 and "Relaunch" in r.body.decode()
     sess = store_of(jp_serverapp).get(s.session_id_from_cookie_header(cookie_header(l)))
-    assert sess is not None and sess.token is None and sess.state_id
+    # pending, and the state is spent: an authorization code is single-use anyway
+    assert sess is not None and sess.token is None and sess.state_id is None
 
 
 async def test_callback_non_object_token_response_is_502(

@@ -98,6 +98,37 @@ def test_check_standalone_config_requires_allowlist():
         ext.check_standalone_config(set(), ext.SMARTIdentityProvider)
 
 
+ALLOWED = {"https://ehr.example/fhir"}
+
+
+def test_check_standalone_config_rejects_default_authorizer():
+    from jupyter_server.auth.authorizer import AllowAllAuthorizer
+
+    with pytest.raises(ValueError, match="SMARTAuthorizer"):
+        ext.check_standalone_config(
+            ALLOWED, ext.SMARTIdentityProvider, AllowAllAuthorizer
+        )
+
+
+def test_check_standalone_config_accepts_smart_authorizer():
+    ext.check_standalone_config(ALLOWED, ext.SMARTIdentityProvider, ext.SMARTAuthorizer)
+
+
+def test_check_standalone_config_ignores_non_smart_idp():
+    from jupyter_server.auth.authorizer import AllowAllAuthorizer
+
+    ext.check_standalone_config(set(), object, AllowAllAuthorizer, [], None)
+
+
+def test_check_standalone_config_warns_on_empty_message_types(caplog):
+    log = logging.getLogger("test-standalone")
+    with caplog.at_level(logging.WARNING, logger="test-standalone"):
+        ext.check_standalone_config(
+            ALLOWED, ext.SMARTIdentityProvider, ext.SMARTAuthorizer, [], log
+        )
+    assert "allowed_message_types is empty" in caplog.text
+
+
 def test_clear_cookie_uses_same_attributes_as_set():
     h = FakeHandler("https")
     ext.clear_session_cookie(h)

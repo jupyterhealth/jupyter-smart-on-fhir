@@ -16,6 +16,7 @@ from jupyter_smart_on_fhir.server_extension import (
     callback_path,
     launch_path,
     login_path,
+    session_path,
 )
 
 ISS = "https://ehr.example/fhir"
@@ -126,3 +127,8 @@ async def test_hub_mode_persists_global_token_for_logged_in_user(
     )
     assert os.environ["SMART_TOKEN"] == "AT-HUB"
     assert os.environ["SMART_TOKEN_FILE"] == str(tmp_path / "legacy.json")
+
+
+async def test_session_probe_is_403_for_hub_user_without_smart_session(jp_fetch):
+    r = await jp_fetch(session_path, raise_error=False)
+    assert r.code == 403
