@@ -20,6 +20,7 @@ from jupyter_smart_on_fhir.session import (
     SESSION_COOKIE_NAME,
     TOKEN_DIR_ENV,
     SMARTSession,
+    SMARTSessionError,
     SMARTSessionStore,
     parse_cookie_header,
 )
@@ -533,9 +534,11 @@ class SMARTLoginHandler(JupyterHandler):
 
 
 class SMARTCallbackHandler(JupyterHandler):
-    """Callback handler for SMART on FHIR"""
+    """OAuth redirect target: validates state against this browser's session only."""
 
-    async def token_for_code(self, code: str, code_verifier: str) -> dict:
+    async def token_for_code(
+        self, code: str, code_verifier: str, token_url: str
+    ) -> dict:
         data = dict(
             client_id=self.settings["smart_client_id"],
             grant_type="authorization_code",
@@ -549,71 +552,89 @@ class SMARTCallbackHandler(JupyterHandler):
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         try:
             token_reply = await AsyncHTTPClient().fetch(
-                self.settings["smart_config"].token_url,
-                body=urlencode(data),
-                headers=headers,
-                method="POST",
+                token_url, body=urlencode(data), headers=headers, method="POST"
             )
         except HTTPClientError as e:
-            self.log.error(
-                "Error fetching token: %s", e.response.body.decode("utf8", "replace")
+            # e.response is None on timeouts/connection errors; never dereference blindly
+            body = (
+                e.response.body.decode("utf8", "replace")
+                if e.response is not None
+                else ""
             )
+            self.log.error("Error fetching token (%s): %s", e.code, body[:500])
             raise
         return json.loads(token_reply.body.decode("utf8", "replace"))
 
     @allow_unauthenticated
     async def get(self):
         require_jupyter_user_unless_smart_idp(self)
-        if "error" in self.request.arguments:
-            raise web.HTTPError(400, self.get_argument("error"))
-        code = self.get_argument("code")
-        if not code:
-            raise web.HTTPError(400, "Error: no code in response from FHIR server")
-        state = self.settings.get("smart_oauth_state")
-        if not state:
-            raise web.HTTPError(400, "Error: missing persisted oauth state")
-        state_id = state["state_id"]
-        arg_state = self.get_argument("state")
+        store = self.settings["smart_session_store"]
+        session = require_session(self)
+        # SMART: validate state on EVERY request to the redirect URL, error responses included.
+        arg_state = self.get_argument("state", "")
         if not arg_state:
             raise web.HTTPError(400, "Error: missing state query argument")
-        if arg_state != state_id:
+        if not session.state_id or arg_state != session.state_id:
             raise web.HTTPError(
-                400, "Error: state received from FHIR server does not match"
+                400,
+                "Error: state received from FHIR server does not match this session",
             )
-        self.settings["smart_oauth_state"] = None
+        if "error" in self.request.arguments:
+            detail = self.get_argument("error_description", "") or self.get_argument(
+                "error"
+            )
+            raise web.HTTPError(400, f"The EHR refused the launch: {detail}")
+        code = self.get_argument("code", "")
+        if not code:
+            raise web.HTTPError(400, "Error: no code in response from FHIR server")
 
-        token_response = await self.token_for_code(
-            code, code_verifier=state["code_verifier"]
-        )
-        smart_auth = self.settings["smart_auth"]
-        self.log.info(
-            "Persisting token info to %s and $SMART_TOKEN", smart_auth.token_file
-        )
-        with Path(smart_auth.token_file).open("w") as f:
-            json.dump(
-                {
-                    "token": token_response,
-                    "fhir_url": self.settings["smart_config"].fhir_url,
-                    # the full output of the .well-known/smart-configuration endpoint
-                    "smart_config": self.settings["smart_config"].smart_config,
-                },
-                f,
-                sort_keys=True,
-                indent=1,
+        try:
+            token_response = await self.token_for_code(
+                code, session.code_verifier, session.smart_config.token_url
             )
-        os.environ["SMART_TOKEN"] = token_response["access_token"]
+            session = store.complete(session.session_id, token_response)
+        except (HTTPClientError, OSError, SMARTSessionError) as e:
+            self.log.error(
+                "SMART token exchange failed for session %s: %s",
+                session.session_id[:8],
+                e,
+            )
+            raise web.HTTPError(
+                502, "Could not obtain a token from the EHR. Relaunch from the EHR."
+            )
+        self.log.info("SMART session %s authenticated", session.session_id[:8])
+
+        smart_auth = self.settings["smart_auth"]
+        if smart_auth.persist_global_token and not is_smart_idp(self):
+            # Hub mode only: one server per user makes the shared file per-user.
+            with Path(smart_auth.token_file).open("w") as f:
+                json.dump(
+                    {
+                        "token": token_response,
+                        "fhir_url": session.fhir_url,
+                        "smart_config": session.smart_config.smart_config,
+                    },
+                    f,
+                    sort_keys=True,
+                    indent=1,
+                )
+            os.environ["SMART_TOKEN"] = token_response["access_token"]
 
         redirected = False
-        hook = self.settings["smart_auth"].smart_callback_hook
+        hook = smart_auth.smart_callback_hook
         if hook:
-            # hook is responsible for redirect (?)
             redirected = await hook(
                 token_response=token_response,
-                smart_config=self.settings["smart_config"],
+                smart_config=session.smart_config,
                 handler=self,
             )
         if not redirected:
-            self.redirect(state["next_url"] or self.base_url)
+            # The render URL names its session so a frame that now holds a different
+            # cookie fails closed instead of showing another patient.
+            dest = url_concat(
+                session.next_url or self.base_url, {"smart_session": session.session_id}
+            )
+            self.redirect(dest)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ token exchange are faked; no SMART sandbox."""
 
 # NOTE: this header has only what Tasks 4 uses; Task 5 adds `parse_qsl`, Task 6 adds
 # `json` and `callback_path` (ruff --fix strips unused imports at each commit).
+import json
 import os
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qsl, urlparse
@@ -16,6 +17,7 @@ from jupyter_smart_on_fhir import session as s
 from jupyter_smart_on_fhir.server_extension import (
     SMARTCallbackHandler,
     SMARTIdentityProvider,
+    callback_path,
     launch_path,
     login_path,
 )
@@ -299,3 +301,168 @@ async def test_login_with_duplicate_session_cookie_is_refused(jp_fetch):
     good = cookie_header(l)
     r = await do_login(jp_fetch, l, cookie=f"{COOKIE}=" + "z" * 32 + "; " + good)
     assert r.code == 400 and "Relaunch from the EHR" in r.body.decode()
+
+
+# ---- callback ---------------------------------------------------------------------
+
+
+async def do_callback(
+    jp_fetch, launch_response, login_response, code="C1", state=None, cookie=None
+):
+    q = dict(parse_qsl(urlparse(login_response.headers["Location"]).query))
+    params = {"code": code, "state": state if state is not None else q["state"]}
+    return await jp_fetch(
+        callback_path,
+        params=params,
+        headers={"Cookie": cookie or cookie_header(launch_response)},
+        follow_redirects=False,
+        raise_error=False,
+    )
+
+
+async def test_callback_completes_session_and_writes_only_its_token_file(
+    jp_fetch, jp_serverapp, fake_token_exchange, tmp_path
+):
+    l = await launch(jp_fetch, next="/after")
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    assert r.code == 302, r.body
+    store = store_of(jp_serverapp)
+    sid = s.session_id_from_cookie_header(cookie_header(l))
+    dest = urlparse(r.headers["Location"])
+    assert dest.path.endswith("/after")
+    assert dict(parse_qsl(dest.query))["smart_session"] == sid
+    sess = store.get(sid)
+    assert store.is_authenticated(sess) and sess.token["access_token"] == "AT-C1"
+    assert fake_token_exchange[0]["token_url"] == "https://ehr.example/token"
+    assert fake_token_exchange[0]["code_verifier"]
+    data = json.loads(store.token_file(sid).read_text())
+    assert data["token"]["access_token"] == "AT-C1" and data["fhir_url"] == ISS
+    assert not (tmp_path / "legacy.json").exists()
+    assert "SMART_TOKEN" not in os.environ
+
+
+async def test_callback_without_next_redirects_to_base_url_with_session(
+    jp_fetch, jp_serverapp, fake_token_exchange
+):
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    dest = urlparse(r.headers["Location"])
+    assert dest.path == jp_serverapp.base_url
+    assert "smart_session" in dict(parse_qsl(dest.query))
+
+
+async def test_callback_replay_is_rejected(jp_fetch, fake_token_exchange):
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    assert (await do_callback(jp_fetch, l, lg)).code == 302
+    assert (await do_callback(jp_fetch, l, lg)).code == 400  # state was single-use
+    assert len(fake_token_exchange) == 1
+
+
+async def test_callback_wrong_state_is_400(jp_fetch, fake_token_exchange):
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    assert (await do_callback(jp_fetch, l, lg, state="not-the-state")).code == 400
+    assert fake_token_exchange == []
+
+
+async def test_callback_without_cookie_is_400(jp_fetch, fake_token_exchange):
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    q = dict(parse_qsl(urlparse(lg.headers["Location"]).query))
+    r = await jp_fetch(
+        callback_path,
+        params={"code": "C1", "state": q["state"]},
+        follow_redirects=False,
+        raise_error=False,
+    )
+    assert r.code == 400 and "open in a new window" in r.body.decode()
+    assert fake_token_exchange == []
+
+
+async def test_two_sessions_do_not_clobber(jp_fetch, jp_serverapp, fake_token_exchange):
+    la = await launch(jp_fetch)
+    lb = await launch(jp_fetch)
+    lga = await do_login(jp_fetch, la)
+    lgb = await do_login(jp_fetch, lb)
+    assert (
+        await do_callback(jp_fetch, la, lgb, code="CA")
+    ).code == 400  # B's state, A's cookie
+    assert (await do_callback(jp_fetch, la, lga, code="CA")).code == 302
+    assert (await do_callback(jp_fetch, lb, lgb, code="CB")).code == 302
+    store = store_of(jp_serverapp)
+    sa = store.get(s.session_id_from_cookie_header(cookie_header(la)))
+    sb = store.get(s.session_id_from_cookie_header(cookie_header(lb)))
+    assert sa.token["access_token"] == "AT-CA" and sb.token["access_token"] == "AT-CB"
+
+
+async def test_callback_error_response_still_validates_state(
+    jp_fetch, fake_token_exchange
+):
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    q = dict(parse_qsl(urlparse(lg.headers["Location"]).query))
+    wrong = await jp_fetch(
+        callback_path,
+        params={"error": "access_denied", "state": "nope"},
+        headers={"Cookie": cookie_header(l)},
+        follow_redirects=False,
+        raise_error=False,
+    )
+    assert wrong.code == 400 and "does not match" in wrong.body.decode()
+    right = await jp_fetch(
+        callback_path,
+        params={
+            "error": "access_denied",
+            "error_description": "User declined",
+            "state": q["state"],
+        },
+        headers={"Cookie": cookie_header(l)},
+        follow_redirects=False,
+        raise_error=False,
+    )
+    assert right.code == 400 and "User declined" in right.body.decode()
+    assert fake_token_exchange == []
+
+
+async def test_callback_token_endpoint_failure_is_502(jp_fetch, monkeypatch):
+    from tornado.httpclient import HTTPClientError
+
+    async def token_for_code(self, code, code_verifier, token_url):
+        raise HTTPClientError(599, "Timeout")  # e.response is None on timeouts
+
+    monkeypatch.setattr(SMARTCallbackHandler, "token_for_code", token_for_code)
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    assert r.code == 502 and "Relaunch" in r.body.decode()
+
+
+async def test_callback_rejects_token_response_without_bearer_access_token(
+    jp_fetch, jp_serverapp, monkeypatch
+):
+    async def token_for_code(self, code, code_verifier, token_url):
+        return {"token_type": "Bearer", "expires_in": 900}  # 2xx but no access_token
+
+    monkeypatch.setattr(SMARTCallbackHandler, "token_for_code", token_for_code)
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    assert r.code == 502
+    sess = store_of(jp_serverapp).get(s.session_id_from_cookie_header(cookie_header(l)))
+    assert (
+        sess is not None and sess.token is None
+    )  # session stays pending, no file written
+
+
+async def test_persist_global_token_is_ignored_in_standalone_mode(
+    jp_fetch, jp_serverapp, fake_token_exchange, tmp_path
+):
+    jp_serverapp.web_app.settings["smart_auth"].persist_global_token = True
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    assert (await do_callback(jp_fetch, l, lg)).code == 302
+    assert not (tmp_path / "legacy.json").exists()
+    assert "SMART_TOKEN" not in os.environ
