@@ -396,6 +396,10 @@ async def test_two_sessions_do_not_clobber(jp_fetch, jp_serverapp, fake_token_ex
     sa = store.get(s.session_id_from_cookie_header(cookie_header(la)))
     sb = store.get(s.session_id_from_cookie_header(cookie_header(lb)))
     assert sa.token["access_token"] == "AT-CA" and sb.token["access_token"] == "AT-CB"
+    assert (
+        fake_token_exchange[0]["code_verifier"]
+        != fake_token_exchange[1]["code_verifier"]
+    )
 
 
 async def test_callback_error_response_still_validates_state(
@@ -451,10 +455,12 @@ async def test_callback_rejects_token_response_without_bearer_access_token(
     lg = await do_login(jp_fetch, l)
     r = await do_callback(jp_fetch, l, lg)
     assert r.code == 502
-    sess = store_of(jp_serverapp).get(s.session_id_from_cookie_header(cookie_header(l)))
+    sid = s.session_id_from_cookie_header(cookie_header(l))
+    sess = store_of(jp_serverapp).get(sid)
     assert (
         sess is not None and sess.token is None
     )  # session stays pending, no file written
+    assert not store_of(jp_serverapp).token_file(sid).exists()
 
 
 async def test_persist_global_token_is_ignored_in_standalone_mode(
@@ -466,3 +472,55 @@ async def test_persist_global_token_is_ignored_in_standalone_mode(
     assert (await do_callback(jp_fetch, l, lg)).code == 302
     assert not (tmp_path / "legacy.json").exists()
     assert "SMART_TOKEN" not in os.environ
+
+
+async def test_callback_token_file_write_failure_is_502_and_session_stays_pending(
+    jp_fetch, jp_serverapp, fake_token_exchange, monkeypatch
+):
+    def fail(self, session_id, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(s.SMARTSessionStore, "_write_token_file", fail)
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    assert r.code == 502 and "Relaunch" in r.body.decode()
+    sess = store_of(jp_serverapp).get(s.session_id_from_cookie_header(cookie_header(l)))
+    assert sess is not None and sess.token is None and sess.state_id
+
+
+async def test_callback_non_object_token_response_is_502(
+    jp_fetch, jp_serverapp, monkeypatch
+):
+    async def token_for_code(self, code, code_verifier, token_url):
+        raise s.SMARTSessionError("Token response is not a JSON object")
+
+    monkeypatch.setattr(SMARTCallbackHandler, "token_for_code", token_for_code)
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    assert r.code == 502 and "Relaunch" in r.body.decode()
+    sess = store_of(jp_serverapp).get(s.session_id_from_cookie_header(cookie_header(l)))
+    assert sess is not None and sess.token is None
+
+
+@pytest.mark.parametrize("body", [b"<html>", b"[1, 2]", b'"AT"'])
+async def test_token_for_code_rejects_body_that_is_not_a_json_object(
+    jp_fetch, jp_serverapp, monkeypatch, body
+):
+    class Reply:
+        pass
+
+    class FakeClient:
+        async def fetch(self, *args, **kwargs):
+            reply = Reply()
+            reply.body = body
+            return reply
+
+    monkeypatch.setattr(ext, "AsyncHTTPClient", FakeClient)
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    assert (
+        r.code == 502 and "Relaunch" in r.body.decode()
+    )  # unguarded, these were a 500

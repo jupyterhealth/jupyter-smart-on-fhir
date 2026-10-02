@@ -108,6 +108,24 @@ def test_complete_writes_private_token_file_and_clears_state(store, clock):
     assert data["expires_at"] == sess.expires_at
 
 
+def test_complete_leaves_session_pending_when_token_file_write_fails(
+    store, monkeypatch
+):
+    sess = store.create("https://ehr.example/fhir", FakeSmartConfig())
+    store.set_oauth_state(sess.session_id, {"state_id": "S1", "code_verifier": "V1"})
+
+    def fail(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(s.os, "replace", fail)
+    with pytest.raises(OSError):
+        store.complete(sess.session_id, {"access_token": "AT", "token_type": "bearer"})
+    assert sess.token is None
+    assert sess.state_id == "S1" and sess.code_verifier == "V1"
+    assert not store.token_file(sess.session_id).exists()
+    assert list(store.token_dir.iterdir()) == []  # temp file cleaned up
+
+
 def test_complete_caps_lifetime_at_session_lifetime(store, clock):
     sess = store.create("https://ehr.example/fhir", FakeSmartConfig())
     store.complete(
@@ -145,6 +163,7 @@ def test_wipe_removes_stale_files_from_disk(tmp_path, clock):
     d = tmp_path / "sessions"
     d.mkdir()
     (d / ("x" * 32 + ".json")).write_text("{}")
+    (d / (".x" + "x" * 31 + ".abc.tmp")).write_text("{}")
     store = s.SMARTSessionStore(d, clock=clock)
     store.wipe()
     assert list(d.iterdir()) == []

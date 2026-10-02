@@ -563,7 +563,13 @@ class SMARTCallbackHandler(JupyterHandler):
             )
             self.log.error("Error fetching token (%s): %s", e.code, body[:500])
             raise
-        return json.loads(token_reply.body.decode("utf8", "replace"))
+        try:
+            token_response = json.loads(token_reply.body.decode("utf8", "replace"))
+        except ValueError:
+            token_response = None
+        if not isinstance(token_response, dict):
+            raise SMARTSessionError("Token response is not a JSON object")
+        return token_response
 
     @allow_unauthenticated
     async def get(self):
@@ -629,8 +635,7 @@ class SMARTCallbackHandler(JupyterHandler):
                 handler=self,
             )
         if not redirected:
-            # The render URL names its session so a frame that now holds a different
-            # cookie fails closed instead of showing another patient.
+            # naming the session makes a frame now holding a different cookie fail closed
             dest = url_concat(
                 session.next_url or self.base_url, {"smart_session": session.session_id}
             )

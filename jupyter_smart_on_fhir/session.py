@@ -113,12 +113,21 @@ class SMARTSessionStore:
         expires_in = token_response.get("expires_in")
         if isinstance(expires_in, (int, float)) and expires_in > 0:
             lifetime = min(lifetime, int(expires_in))
+        expires_at = self.clock() + lifetime
+        smart_config = getattr(sess.smart_config, "smart_config", sess.smart_config)
+        payload = {
+            "token": token_response,
+            "fhir_url": sess.fhir_url,
+            "smart_config": smart_config,
+            "expires_at": expires_at,
+        }
+        # File first: a failed write must leave the session pending, not half-authenticated.
+        self._write_token_file(session_id, payload)
         sess.token = token_response
-        sess.expires_at = self.clock() + lifetime
+        sess.expires_at = expires_at
         # state is single-use: a replayed callback must not re-mint a token
         sess.state_id = None
         sess.code_verifier = None
-        self._write_token_file(sess)
         return sess
 
     def delete(self, session_id: str) -> None:
@@ -140,8 +149,9 @@ class SMARTSessionStore:
     def wipe(self) -> None:
         """Remove every token file on disk (server startup: no session survives a restart)."""
         self._sessions.clear()
-        for path in self.token_dir.glob("*.json"):
-            path.unlink()
+        for pattern in ("*.json", ".*.tmp"):  # .tmp: a write cut short by a crash
+            for path in self.token_dir.glob(pattern):
+                path.unlink()
 
     def token_file(self, session_id: str) -> Path:
         if not SAFE_SESSION_ID.match(session_id or ""):
@@ -154,18 +164,18 @@ class SMARTSessionStore:
             raise SMARTSessionError("Unknown or expired SMART session")
         return sess
 
-    def _write_token_file(self, sess: SMARTSession) -> None:
-        smart_config = getattr(sess.smart_config, "smart_config", sess.smart_config)
-        payload = {
-            "token": sess.token,
-            "fhir_url": sess.fhir_url,
-            "smart_config": smart_config,
-            "expires_at": sess.expires_at,
-        }
-        path = self.token_file(sess.session_id)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, sort_keys=True, indent=1)
+    def _write_token_file(self, session_id: str, payload: dict[str, Any]) -> None:
+        path = self.token_file(session_id)
+        # Temp name is not *.json so readers never see a partial token file.
+        tmp = self.token_dir / f".{session_id}.{secrets.token_hex(8)}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f, sort_keys=True, indent=1)
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
 
 # --- kernel-side helpers (no server objects available here) -------------------------
