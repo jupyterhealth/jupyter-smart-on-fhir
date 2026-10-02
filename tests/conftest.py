@@ -14,6 +14,8 @@ pytest_plugins = ["pytest_jupyter.jupyter_server"]
 
 @pytest.fixture(scope="function")  # module?
 def sandbox():
+    if "SANDBOX_DIR" not in os.environ:
+        pytest.skip("needs the SMART launcher sandbox (SANDBOX_DIR); CI provides it")
     port = 5555
     os.environ["PORT"] = str(port)
     url = f"http://localhost:{port}"

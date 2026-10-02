@@ -29,7 +29,7 @@ test = [
   "jupyter-smart-on-fhir[hubservice,serverextension]",
 ]
 hubservice = ["flask", "jupyterhub"]
-serverextension = ["jupyter-server", "tornado"]
+serverextension = ["jupyter-server>=2.13", "tornado"]
 
 [project.urls]
 Homepage = "https://github.com/jupyterhealth/jupyter-smart-on-fhir"

@@ -37,3 +37,4 @@ jupyterhub-proxy.pid
 # pixi environments
 .pixi
 *.egg-info
+.venv/
