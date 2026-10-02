@@ -71,7 +71,9 @@ Under **JupyterHub** keep Hub's identity provider. The launch handlers still req
 logged-in Jupyter user there. `allowed_issuers` is optional under Hub (a startup warning
 when empty; enforced when set). Set `c.SMARTExtensionApp.persist_global_token = True` to
 keep writing `smart_token.json` + `$SMART_TOKEN` for notebook kernels (one server per user
-makes that per-user); it is ignored in standalone mode.
+makes that per-user); it is ignored in standalone mode. Upgrading from 0.1.x:
+`smart_token.json` and `$SMART_TOKEN` are no longer written unless
+`persist_global_token=True`.
 
 Configure `SMARTExtensionApp` in `jupyter_server_config.py`:
 
