@@ -96,3 +96,15 @@ def test_check_standalone_config_requires_allowlist():
     ext.check_standalone_config(set(), object)  # not standalone: fine
     with pytest.raises(ValueError, match="allowed_issuers"):
         ext.check_standalone_config(set(), ext.SMARTIdentityProvider)
+
+
+def test_clear_cookie_uses_same_attributes_as_set():
+    h = FakeHandler("https")
+    ext.clear_session_cookie(h)
+    ((_, header),) = h.headers
+    assert header.startswith("smart-session=;") and "Max-Age=0" in header
+    assert (
+        "Secure" in header
+        and "SameSite=None" in header
+        and header.endswith("; Partitioned")
+    )

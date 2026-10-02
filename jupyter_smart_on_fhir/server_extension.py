@@ -5,8 +5,9 @@ from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
 
 from jupyter_core.paths import jupyter_runtime_dir
+from jupyter_server.auth.authorizer import Authorizer
 from jupyter_server.auth.decorator import allow_unauthenticated
-from jupyter_server.auth.identity import IdentityProvider
+from jupyter_server.auth.identity import IdentityProvider, User
 from jupyter_server.base.handlers import JupyterHandler
 from jupyter_server.extension.application import ExtensionApp
 from jupyter_server.utils import url_path_join
@@ -23,12 +24,14 @@ from jupyter_smart_on_fhir.session import (
     SMARTSessionError,
     SMARTSessionStore,
     parse_cookie_header,
+    session_id_from_cookie_header,
 )
 
 smart_path = "smart-on-fhir"
 launch_path = f"{smart_path}/launch"
 login_path = f"{smart_path}/login"
 callback_path = f"{smart_path}/callback"
+session_path = f"{smart_path}/session"
 
 
 def _jupyter_server_extension_points():
@@ -222,6 +225,7 @@ class SMARTExtensionApp(ExtensionApp):
                 (launch_path, SMARTLaunchHandler),
                 (login_path, SMARTLoginHandler),
                 (callback_path, SMARTCallbackHandler),
+                (session_path, SMARTSessionInfoHandler),
             ]
         )
 
@@ -249,10 +253,6 @@ def get_next_url(handler):
     else:
         next_url = handler.base_url
     return next_url
-
-
-class SMARTIdentityProvider(IdentityProvider):
-    """Completed in a later task; declared here so config checks can reference it."""
 
 
 def normalize_issuer(url: str) -> str:
@@ -640,6 +640,124 @@ class SMARTCallbackHandler(JupyterHandler):
                 session.next_url or self.base_url, {"smart_session": session.session_id}
             )
             self.redirect(dest)
+
+
+NOT_LAUNCHED_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>Not launched</title></head><body style="font-family:sans-serif;margin:3rem">
+<h1>This app must be opened from your EHR.</h1>
+<p>Open the patient chart in your EHR and launch the app from there. There is no
+separate login.</p></body></html>"""
+
+
+class SMARTNotLaunchedHandler(JupyterHandler):
+    """Stands in for /login: the only way in is an EHR launch, so this is a 403 page."""
+
+    @allow_unauthenticated
+    def get(self):
+        self.set_status(403)
+        self.set_header("Content-Type", "text/html; charset=utf-8")
+        self.finish(NOT_LAUNCHED_HTML)
+
+
+class SMARTSessionInfoHandler(JupyterHandler):
+    """Cheap authenticated probe: lets a page confirm its cookie works and tests
+    confirm identity without going through the authorizer-guarded API."""
+
+    @web.authenticated
+    def get(self):
+        session, _ = resolve_session(self)
+        self.set_header("Content-Type", "application/json")
+        self.finish(
+            json.dumps(
+                {"session": session.session_id[:12], "expires_at": session.expires_at}
+            )
+        )
+
+
+class SMARTIdentityProvider(IdentityProvider):
+    """Standalone-server identity: a user exists only for a browser whose session was
+    minted by an EHR launch on this server and has completed the OAuth callback.
+
+    Configure with
+    `c.ServerApp.identity_provider_class = "jupyter_smart_on_fhir.server_extension.SMARTIdentityProvider"`
+    together with SMARTAuthorizer and a non-empty allowed_issuers. Do not use under
+    JupyterHub (Hub's provider stays in charge there).
+    """
+
+    @default("login_handler_class")
+    def _login_handler_class_default(self):
+        return SMARTNotLaunchedHandler
+
+    def get_user(self, handler):
+        store = handler.settings.get("smart_session_store")
+        session, reason = resolve_session(handler)
+        if reason != "ok" or store is None or not store.is_authenticated(session):
+            return None
+        # A render URL names its session; a frame whose cookie now belongs to another
+        # launch must fail closed rather than show that other patient.
+        wanted = handler.get_arguments("smart_session")
+        # A crafted next_url may carry its own smart_session, so every value must match.
+        if len(wanted) > 1 or (wanted and wanted[0] != session.session_id):
+            handler.log.warning(
+                "smart_session query arg does not match the cookie's session"
+            )
+            return None
+        return User(username=f"smart-{session.session_id[:12]}")
+
+    def clear_login_cookie(self, handler):
+        session, _ = resolve_session(handler)
+        if session is not None:
+            handler.settings["smart_session_store"].delete(session.session_id)
+        clear_session_cookie(handler)
+
+
+def clear_session_cookie(handler) -> None:
+    """Deletion must carry the same attributes as the set (Secure/SameSite/Partitioned),
+    or the browser keeps the partitioned cookie."""
+    smart_auth = handler.settings["smart_auth"]
+    secure = smart_auth.cookie_secure
+    if secure is None:
+        secure = handler.request.protocol == "https"
+    header = f"{smart_auth.cookie_name}=; Path={handler.base_url}; Max-Age=0; HttpOnly"
+    header += "; Secure; SameSite=None" if secure else "; SameSite=Lax"
+    if secure and smart_auth.cookie_partitioned:
+        header += "; Partitioned"
+    handler.add_header("Set-Cookie", header)
+
+
+def kernel_session_id(handler, kernel_id: str) -> str | None:
+    """Session that started this kernel, read from the Cookie header Voilà put in its env."""
+    try:
+        km = handler.kernel_manager.get_kernel(kernel_id)
+    except Exception:
+        return None
+    env = (getattr(km, "_launch_args", None) or {}).get("env") or {}
+    return session_id_from_cookie_header(
+        env.get("HTTP_COOKIE"),
+        handler.settings.get("smart_session_cookie_name", SESSION_COOKIE_NAME),
+    )
+
+
+class SMARTAuthorizer(Authorizer):
+    """A SMART session may only talk to the kernel Voilà started for it. Everything
+    else in the Jupyter API (contents, terminals, sessions, kernel listing/creation,
+    kernelspecs, config, ...) is denied. Voilà's render and shutdown routes are not
+    authorizer-guarded, so rendering is unaffected."""
+
+    def is_authorized(self, handler, user, action, resource):
+        if resource != "kernels" or action not in ("execute", "read"):
+            return False
+        kernel_id = (
+            handler.path_kwargs.get("kernel_id") if handler.path_kwargs else None
+        )
+        if not kernel_id and handler.path_args:
+            kernel_id = handler.path_args[0]
+        if not kernel_id:
+            return False  # kernel listing
+        session, _ = resolve_session(handler)
+        if session is None:
+            return False
+        return kernel_session_id(handler, kernel_id) == session.session_id
 
 
 if __name__ == "__main__":
