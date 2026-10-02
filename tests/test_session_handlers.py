@@ -6,7 +6,7 @@ token exchange are faked; no SMART sandbox."""
 # `json` and `callback_path` (ruff --fix strips unused imports at each commit).
 import os
 from http.cookies import SimpleCookie
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import pytest
 from traitlets.config import Config
@@ -225,3 +225,77 @@ async def test_settings_exported_for_kernels_and_startup_wipes_token_dir(
     assert jp_serverapp.web_app.settings["smart_allowed_issuers"] == {ISS}
     assert jp_serverapp.web_app.settings["smart_discovery_cache"] == {}
     assert list(os.scandir(smart_auth.token_dir)) == []
+
+
+# ---- login ------------------------------------------------------------------------
+
+
+async def do_login(jp_fetch, launch_response, cookie=None):
+    q = dict(parse_qsl(urlparse(launch_response.headers["Location"]).query))
+    return await jp_fetch(
+        login_path,
+        params=q,
+        headers={"Cookie": cookie or cookie_header(launch_response)},
+        follow_redirects=False,
+        raise_error=False,
+    )
+
+
+async def test_login_binds_state_to_this_session(jp_fetch, jp_serverapp):
+    l = await launch(jp_fetch, next="/after")
+    r = await do_login(jp_fetch, l)
+    assert r.code == 302, r.body
+    auth = urlparse(r.headers["Location"])
+    assert (auth.scheme, auth.netloc, auth.path) == (
+        "https",
+        "ehr.example",
+        "/authorize",
+    )
+    q = dict(parse_qsl(auth.query))
+    sess = store_of(jp_serverapp).get(s.session_id_from_cookie_header(cookie_header(l)))
+    assert q["state"] == sess.state_id
+    assert q["code_challenge_method"] == "S256"
+    assert (
+        q["aud"] == ISS and q["client_id"] == "client-123" and q["launch"] == "L1"
+    )  # aud == iss as sent (SMART)
+    assert sess.next_url.endswith("/after")
+    assert "smart_oauth_state" not in jp_serverapp.web_app.settings
+    assert "smart_config" not in jp_serverapp.web_app.settings
+
+
+async def test_login_without_cookie_is_400_with_cookie_guidance(jp_fetch):
+    l = await launch(jp_fetch)
+    q = dict(parse_qsl(urlparse(l.headers["Location"]).query))
+    r = await jp_fetch(login_path, params=q, follow_redirects=False, raise_error=False)
+    assert r.code == 400
+    assert "open in a new window" in r.body.decode()
+
+
+async def test_login_with_stale_cookie_is_400_with_relaunch_guidance(
+    jp_fetch, jp_serverapp
+):
+    l = await launch(jp_fetch)
+    store_of(jp_serverapp).delete(
+        s.session_id_from_cookie_header(cookie_header(l))
+    )  # restart/expiry
+    r = await do_login(jp_fetch, l)
+    assert r.code == 400
+    body = r.body.decode()
+    assert "Relaunch from the EHR" in body and "open in a new window" not in body
+
+
+async def test_login_with_tampered_cookie_is_400_with_relaunch_guidance(jp_fetch):
+    # A cookie that is PRESENT but unverifiable is what a server restart produces (new
+    # cookie secret on an ephemeral filesystem), so it must not blame the browser.
+    l = await launch(jp_fetch)
+    r = await do_login(jp_fetch, l, cookie=f"{COOKIE}=" + "z" * 32)
+    assert r.code == 400
+    body = r.body.decode()
+    assert "Relaunch from the EHR" in body and "open in a new window" not in body
+
+
+async def test_login_with_duplicate_session_cookie_is_refused(jp_fetch):
+    l = await launch(jp_fetch)
+    good = cookie_header(l)
+    r = await do_login(jp_fetch, l, cookie=f"{COOKIE}=" + "z" * 32 + "; " + good)
+    assert r.code == 400 and "Relaunch from the EHR" in r.body.decode()

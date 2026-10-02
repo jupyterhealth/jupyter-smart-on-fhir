@@ -502,21 +502,19 @@ class SMARTLaunchHandler(JupyterHandler):
 
 
 class SMARTLoginHandler(JupyterHandler):
-    """Login handler for SMART on FHIR"""
+    """Builds the EHR authorize URL with state/PKCE stored on this browser's session."""
 
     @allow_unauthenticated
     def get(self):
         require_jupyter_user_unless_smart_idp(self)
+        store = self.settings["smart_session_store"]
+        session = require_session(self)
         state = generate_state(get_next_url(self))
-        # only allow a single oauth state to be valid at a time
-        if self.settings.get("smart_oauth_state"):
-            self.log.warning("Overwriting stale smart oauth state")
-        self.settings["smart_oauth_state"] = state
+        store.set_oauth_state(session.session_id, state)
         if state["next_url"]:
             self.log.info("Will redirect to %s after SMART login", state["next_url"])
 
-        smart_config = self.settings["smart_config"]
-        auth_url = smart_config.auth_url
+        smart_config = session.smart_config
         oauth_params = {
             "aud": smart_config.fhir_url,
             "state": state["state_id"],
@@ -531,7 +529,7 @@ class SMARTLoginHandler(JupyterHandler):
             "response_type": "code",
             "scope": self.get_argument("scope"),
         }
-        self.redirect(url_concat(auth_url, oauth_params))
+        self.redirect(url_concat(smart_config.auth_url, oauth_params))
 
 
 class SMARTCallbackHandler(JupyterHandler):
