@@ -1,10 +1,15 @@
 import json
 import os
+from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
 
+import jwt
 import tornado
 from jupyter_core.paths import jupyter_runtime_dir
+from jupyter_server.auth.decorator import allow_unauthenticated
+from jupyter_server.auth.identity import IdentityProvider, User
 from jupyter_server.base.handlers import JupyterHandler
 from jupyter_server.extension.application import ExtensionApp
 from jupyter_server.utils import url_path_join
@@ -25,6 +30,80 @@ def _jupyter_server_extension_points():
     return [
         {"module": "jupyter_smart_on_fhir.server_extension", "app": SMARTExtensionApp}
     ]
+
+
+def authenticated_unless_smart_auth(method):
+    """Protect an endpoint unless smart auth is enabled
+
+    If using SMART for auth, allow unauthenticated access,
+    otherwise protect it via regular auth.
+
+    Applied to the requests leading up to SMART launch,
+    after which regular auth is applied.
+    """
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        identity_provider = self.settings["identity_provider"]
+        if isinstance(identity_provider, SMARTIdentityProvider):
+            wrap = allow_unauthenticated
+        else:
+            wrap = web.authenticated
+        return wrap(method)(self, *args, **kwargs)
+
+    return wrapped
+
+
+@dataclass
+class SMARTTokenUser(User):
+    smart_token: str = (
+        ""  # required, but needs a default due to dataclass init nonsense
+    )
+
+
+class SMARTIdentityProvider(IdentityProvider):
+    """
+    IdentityProvider that users SMART launch itself for auth.
+
+    Upon completion of auth, the launch token is stored,
+    associated with the browser.
+
+    Subsequent requests compare the token stored in the cookie with the current stateful $SMART_TOKEN,
+    and only accept requests from the browser that set that token.
+    """
+
+    def persist_user_model(self, handler: web.RequestHandler) -> None:
+        """Persist the user model to a cookie."""
+        self.set_login_cookie(handler, handler.current_user)
+
+    async def get_user_token(self, handler: web.RequestHandler):
+        token = self.get_token(handler)
+        if token:
+            return self.user_from_token(token)
+        else:
+            return None
+
+    def user_from_token(self, token: str) -> SMARTTokenUser | None:
+        if not token or token != os.getenv("SMART_TOKEN"):
+            # app has only one active smart token at a time,
+            # reject previously authorized clients
+            self.log.warning("Not accepting mismatched SMART token")
+            return None
+
+        try:
+            id_token = jwt.decode(token, options={"verify_signature": False})
+        except Exception as e:
+            self.log.exception("Failed to decode id token")
+            return None
+        else:
+            username = id_token["fhirUser"]
+        return SMARTTokenUser(username=username, smart_token=token)
+
+    def user_to_cookie(self, user: SMARTTokenUser):
+        return user.smart_token
+
+    def user_from_cookie(self, cookie):
+        return self.user_from_token(cookie)
 
 
 class SMARTExtensionApp(ExtensionApp):
@@ -146,7 +225,7 @@ def get_next_url(handler):
 class SMARTLaunchHandler(JupyterHandler):
     """Handler for SMART on FHIR authentication"""
 
-    @tornado.web.authenticated
+    @authenticated_unless_smart_auth
     async def get(self):
         smart_auth = self.settings["smart_auth"]
         fhir_url = self.get_argument("iss", self.settings["smart_default_issuer"])
@@ -186,7 +265,7 @@ class SMARTLaunchHandler(JupyterHandler):
 class SMARTLoginHandler(JupyterHandler):
     """Login handler for SMART on FHIR"""
 
-    @tornado.web.authenticated
+    @authenticated_unless_smart_auth
     def get(self):
         state = generate_state(get_next_url(self))
         # only allow a single oauth state to be valid at a time
@@ -244,7 +323,7 @@ class SMARTCallbackHandler(JupyterHandler):
             raise
         return json.loads(token_reply.body.decode("utf8", "replace"))
 
-    @tornado.web.authenticated
+    @authenticated_unless_smart_auth
     async def get(self):
         if "error" in self.request.arguments:
             raise tornado.web.HTTPError(400, self.get_argument("error"))
@@ -285,6 +364,16 @@ class SMARTCallbackHandler(JupyterHandler):
                 sort_keys=True,
                 indent=1,
             )
+        # if using SMART for Auth, persist token
+        # for subsequent cookie-authenticated requests
+        identity_provider = self.settings["identity_provider"]
+        if isinstance(identity_provider, SMARTIdentityProvider):
+            smart_token = token_response["access_token"]
+            id_token = jwt.decode(smart_token, options={"verify_signature": False})
+            username = id_token["fhirUser"]
+            user = SMARTTokenUser(username=username, smart_token=smart_token)
+            identity_provider.set_login_cookie(self, user)
+
         os.environ["SMART_TOKEN"] = token_response["access_token"]
 
         redirected = False

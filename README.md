@@ -36,6 +36,18 @@ c.SMARTExtensionApp.client_id = "your-client-id"
 
 see sourcecode in `server_extension.py` for now for more options.
 
+### Server Extension Authentication
+
+By setting:
+
+```python
+c.ServerApp.identity_provider_class = "jupyter_smart_on_fhir.server_extension.SMARTIdentityProvider"
+```
+
+the SMART launch process will be used to authenticate access to all of Jupyter Server.
+Only browsers that have completed the SMART launch process will be able to make any requests to the server,
+and the latest SMART launch token may be used as a Bearer token to communicate with the Jupyter Server.
+
 ## JupyterHub Service
 
 The JupyterHub service is a bare proof of concept which completes the SMART flow and fetches some sample data, it is not useful yet.

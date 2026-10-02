@@ -4,6 +4,7 @@ import os
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from urllib import parse
 
 import pytest
@@ -97,3 +98,25 @@ class SandboxConfig:
             }
         )
         return query
+
+
+@pytest.fixture
+def client_id():
+    return "client_id"
+
+
+@pytest.fixture
+def fetch_noauth(jp_fetch):
+    return partial(jp_fetch, headers={"Authorization": ""})
+
+
+@pytest.fixture
+def public_client(client_id):
+    return SandboxConfig(
+        client_id=client_id,
+        client_type=0,
+        pkce_validation=2,
+        # setting IDs so we omit login screen in sandbox; unsure I would test that flow
+        patient_ids=["6bb97c2b-8762-4763-ad16-2d88db590b74"],
+        provider_ids=["63003abb-3924-46df-a75a-0a1f42733189"],
+    )

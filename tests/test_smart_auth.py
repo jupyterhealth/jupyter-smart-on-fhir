@@ -9,6 +9,7 @@ from tornado.httpclient import AsyncHTTPClient, HTTPClientError
 from traitlets.config import Config
 
 from jupyter_smart_on_fhir.server_extension import (
+    SMARTIdentityProvider,
     callback_path,
     launch_path,
     login_path,
@@ -18,46 +19,20 @@ from jupyter_smart_on_fhir.server_extension import (
 @pytest.fixture
 def jp_server_config(client_id):
     c = Config()
+    c.ServerApp.identity_provider_class = (
+        "jupyter_smart_on_fhir.server_extension.SMARTIdentityProvider"
+    )
     c.ServerApp.jpserver_extensions = {"jupyter_smart_on_fhir.server_extension": True}
     c.SMARTExtensionApp.client_id = client_id
 
     return c
 
 
-async def test_uninformed_endpoint(jp_fetch):
-    with pytest.raises(HTTPClientError) as e:
-        await jp_fetch(launch_path)
-    assert e.value.code == 400
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        launch_path,
-        callback_path,
-    ],
-)
-async def test_auth_protected(jp_base_url, fetch_noauth, public_client, sandbox, path):
-    """
-    Make sure auth is required to initiate smart launch
-    """
-    with pytest.raises(HTTPClientError) as exc_info:
-        response = await fetch_noauth(
-            path,
-            follow_redirects=False,
-        )
-    response = exc_info.value.response
-    assert response.code == 302
-    redirect_url = response.headers["Location"]
-    redirect = urlparse(redirect_url)
-    assert redirect.path == url_path_join(jp_base_url, "login")
-
-
-async def test_login_handler(
-    http_server_client, jp_base_url, jp_fetch, jp_serverapp, sandbox, public_client
+async def test_smart_launch(
+    http_server_client, jp_base_url, fetch_noauth, jp_serverapp, sandbox, public_client
 ):
-    """I think this test can be split in three with some engineering. Perhaps useful, not sure"""
     # Try endpoint and get redirected to login
+    assert type(jp_serverapp.identity_provider) is SMARTIdentityProvider
     next_path = url_path_join("/test-next?a=b&c=d")
     query = {
         "iss": f"{sandbox}/v/r4/fhir",
@@ -65,7 +40,7 @@ async def test_login_handler(
         "next": next_path,
     }
     with pytest.raises(HTTPClientError) as exc_info:
-        response = await jp_fetch(
+        response = await fetch_noauth(
             launch_path,
             params=query,
             follow_redirects=False,
@@ -82,7 +57,7 @@ async def test_login_handler(
 
     # Login with headers and get redirected to auth url
     with pytest.raises(HTTPClientError) as exc_info:
-        response = await jp_fetch(
+        response = await fetch_noauth(
             login_path, params=login_query, follow_redirects=False
         )
     response = exc_info.value.response
@@ -114,7 +89,7 @@ async def test_login_handler(
         f"{morsel.key}={morsel.coded_value}" for morsel in cookie.values()
     )
     with pytest.raises(HTTPClientError) as exc_info:
-        await jp_fetch(
+        await fetch_noauth(
             callback_path,
             params=params,
             headers={"Cookie": cookie_header},
@@ -127,11 +102,42 @@ async def test_login_handler(
     assert dest_url == url_path_join(jp_base_url, next_path)
     assert "SMART_TOKEN" in os.environ
     token = os.environ["SMART_TOKEN"]
-    smart_config = jp_serverapp.web_app.settings["smart_config"]
-    url = url_path_join(smart_config.fhir_url, "Condition")
-    resp = await http_client.fetch(url, headers={"Authorization": f"Bearer {token}"})
-    data = json.loads(resp.body.decode("utf8"))
-    assert data
-    assert isinstance(data, dict)
-    assert "resourceType" in data
-    assert data["resourceType"] == "Bundle"
+
+    # load login cookie
+    cookie = SimpleCookie()
+    for c in response.headers.get_list("Set-Cookie"):
+        cookie.load(c)
+    cookie_header = "; ".join(
+        f"{morsel.key}={morsel.coded_value}" for morsel in cookie.values()
+    )
+
+    resp = await fetch_noauth(
+        "api/me",
+        headers={"Cookie": cookie_header},
+    )
+    me = json.loads(resp.body.decode("utf8"))
+    practitioner_id = public_client.provider_ids[0]
+    username = f"Practitioner/{practitioner_id}"
+    assert me["identity"]["username"] == username
+
+    resp = await fetch_noauth("api/me", headers={"Authorization": f"Bearer {token}"})
+    me = json.loads(resp.body.decode("utf8"))
+    assert me["identity"]["username"] == username
+
+    # auth should no longer be valid after new token is issued
+    os.environ["SMART_TOKEN"] = "new_token"
+
+    with pytest.raises(HTTPClientError) as exc_info:
+        resp = await fetch_noauth(
+            "api/me",
+            headers={"Cookie": cookie_header},
+        )
+    response = exc_info.value.response
+    assert response.code == 403
+
+    with pytest.raises(HTTPClientError) as exc_info:
+        resp = await fetch_noauth(
+            "api/me", headers={"Authorization": f"Bearer {token}"}
+        )
+    response = exc_info.value.response
+    assert response.code == 403
