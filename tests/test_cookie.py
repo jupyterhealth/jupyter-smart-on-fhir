@@ -103,6 +103,7 @@ def test_clear_cookie_uses_same_attributes_as_set():
     ext.clear_session_cookie(h)
     ((_, header),) = h.headers
     assert header.startswith("smart-session=;") and "Max-Age=0" in header
+    assert "Path=/app/" in header and "HttpOnly" in header
     assert (
         "Secure" in header
         and "SameSite=None" in header

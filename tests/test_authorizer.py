@@ -9,7 +9,9 @@ from jupyter_smart_on_fhir.session import SMARTSession
 
 class FakeKM:
     def __init__(self, cookie):
-        self._launch_args = {"env": {"HTTP_COOKIE": cookie}} if cookie is not None else {}
+        self._launch_args = (
+            {"env": {"HTTP_COOKIE": cookie}} if cookie is not None else {}
+        )
 
 
 class FakeKernelManager:
@@ -25,8 +27,14 @@ class FakeStore:
 
     def __init__(self, ids):
         self.sessions = {
-            sid: SMARTSession(session_id=sid, fhir_url="https://ehr.example/fhir", smart_config=None,
-                              created=0.0, expires_at=9e12, token={"access_token": "AT"})
+            sid: SMARTSession(
+                session_id=sid,
+                fhir_url="https://ehr.example/fhir",
+                smart_config=None,
+                created=0.0,
+                expires_at=9e12,
+                token={"access_token": "AT"},
+            )
             for sid in ids
         }
 
@@ -61,9 +69,11 @@ class FakeHandler:
 
 
 A, B = "a" * 32, "b" * 32
-KERNELS = {"k-a": FakeKM(f"smart-session={signed('smart-session', A)}"),
-           "k-b": FakeKM(f"smart-session={signed('smart-session', B)}"),
-           "k-none": FakeKM(None)}
+KERNELS = {
+    "k-a": FakeKM(f"smart-session={signed('smart-session', A)}"),
+    "k-b": FakeKM(f"smart-session={signed('smart-session', B)}"),
+    "k-none": FakeKM(None),
+}
 auth = ext.SMARTAuthorizer()
 
 
@@ -79,17 +89,64 @@ def test_other_sessions_kernel_denied():
 
 
 def test_kernel_without_session_env_or_unknown_denied():
-    assert auth.is_authorized(FakeHandler(A, KERNELS, "k-none"), object(), "execute", "kernels") is False
-    assert auth.is_authorized(FakeHandler(A, KERNELS, "nope"), object(), "execute", "kernels") is False
+    assert (
+        auth.is_authorized(
+            FakeHandler(A, KERNELS, "k-none"), object(), "execute", "kernels"
+        )
+        is False
+    )
+    assert (
+        auth.is_authorized(
+            FakeHandler(A, KERNELS, "nope"), object(), "execute", "kernels"
+        )
+        is False
+    )
 
 
 def test_kernel_write_and_list_denied():
-    assert auth.is_authorized(FakeHandler(A, KERNELS, "k-a"), object(), "write", "kernels") is False
-    assert auth.is_authorized(FakeHandler(A, KERNELS), object(), "read", "kernels") is False  # list, no id
+    assert (
+        auth.is_authorized(FakeHandler(A, KERNELS, "k-a"), object(), "write", "kernels")
+        is False
+    )
+    assert (
+        auth.is_authorized(FakeHandler(A, KERNELS), object(), "read", "kernels")
+        is False
+    )  # list, no id
 
 
 def test_everything_else_denied():
     h = FakeHandler(A, KERNELS)
-    for resource in ("contents", "terminals", "sessions", "kernelspecs", "api", "config", "nbconvert"):
+    for resource in (
+        "contents",
+        "terminals",
+        "sessions",
+        "kernelspecs",
+        "api",
+        "config",
+        "nbconvert",
+    ):
         for action in ("read", "write", "execute"):
-            assert auth.is_authorized(h, object(), action, resource) is False, (action, resource)
+            assert auth.is_authorized(h, object(), action, resource) is False, (
+                action,
+                resource,
+            )
+
+
+def test_read_on_other_sessions_kernel_denied():
+    assert (
+        auth.is_authorized(FakeHandler(A, KERNELS, "k-b"), object(), "read", "kernels")
+        is False
+    )
+
+
+def test_kernel_id_from_path_args_fallback():
+    h = FakeHandler(A, KERNELS)
+    h.path_args = ("k-a",)
+    assert auth.is_authorized(h, object(), "execute", "kernels") is True
+
+
+def test_kernel_with_launch_args_none_denied():
+    km = FakeKM(None)
+    km._launch_args = None
+    h = FakeHandler(A, {"k-x": km}, "k-x")
+    assert auth.is_authorized(h, object(), "execute", "kernels") is False

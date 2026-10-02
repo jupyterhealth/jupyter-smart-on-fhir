@@ -49,7 +49,13 @@ def fakes(monkeypatch):
         }
 
     async def token_for_code(self, code, code_verifier, token_url):
-        return {"access_token": "AT", "token_type": "Bearer", "id_token": "IDT", "patient": "P1", "expires_in": 900}
+        return {
+            "access_token": "AT",
+            "token_type": "Bearer",
+            "id_token": "IDT",
+            "patient": "P1",
+            "expires_in": 900,
+        }
 
     monkeypatch.setattr(ext, "fetch_discovery_document", fetch_discovery_document)
     monkeypatch.setattr(SMARTCallbackHandler, "token_for_code", token_for_code)
@@ -70,7 +76,9 @@ def follow_redirects(http_server_client, monkeypatch):
 
 
 def cookie_header(response) -> str:
-    hits = [h for h in response.headers.get_list("Set-Cookie") if h.startswith(f"{COOKIE}=")]
+    hits = [
+        h for h in response.headers.get_list("Set-Cookie") if h.startswith(f"{COOKIE}=")
+    ]
     assert len(hits) == 1
     jar = SimpleCookie()
     jar.load(hits[0])
@@ -79,15 +87,31 @@ def cookie_header(response) -> str:
 
 async def complete_launch(jp_fetch) -> str:
     """Run launch→login→callback; return the authenticated browser's Cookie header."""
-    l = await jp_fetch(launch_path, params={"iss": ISS, "launch": "L1"}, follow_redirects=False, raise_error=False)
+    l = await jp_fetch(
+        launch_path,
+        params={"iss": ISS, "launch": "L1"},
+        follow_redirects=False,
+        raise_error=False,
+    )
     assert l.code == 302, l.body
     cookie = cookie_header(l)
     q = dict(parse_qsl(urlparse(l.headers["Location"]).query))
-    lg = await jp_fetch(login_path, params=q, headers={"Cookie": cookie}, follow_redirects=False, raise_error=False)
+    lg = await jp_fetch(
+        login_path,
+        params=q,
+        headers={"Cookie": cookie},
+        follow_redirects=False,
+        raise_error=False,
+    )
     assert lg.code == 302, lg.body
     state = dict(parse_qsl(urlparse(lg.headers["Location"]).query))["state"]
-    cb = await jp_fetch(callback_path, params={"code": "C1", "state": state}, headers={"Cookie": cookie},
-                        follow_redirects=False, raise_error=False)
+    cb = await jp_fetch(
+        callback_path,
+        params={"code": "C1", "state": state},
+        headers={"Cookie": cookie},
+        follow_redirects=False,
+        raise_error=False,
+    )
     assert cb.code == 302, cb.body
     return cookie
 
@@ -115,8 +139,15 @@ async def test_session_info_with_authenticated_session_is_200(jp_fetch, jp_serve
 
 
 async def test_pending_session_is_not_a_user(jp_fetch):
-    l = await jp_fetch(launch_path, params={"iss": ISS, "launch": "L1"}, follow_redirects=False, raise_error=False)
-    r = await jp_fetch(session_path, headers={"Cookie": cookie_header(l)}, raise_error=False)
+    l = await jp_fetch(
+        launch_path,
+        params={"iss": ISS, "launch": "L1"},
+        follow_redirects=False,
+        raise_error=False,
+    )
+    r = await jp_fetch(
+        session_path, headers={"Cookie": cookie_header(l)}, raise_error=False
+    )
     assert r.code == 403
 
 
@@ -124,29 +155,52 @@ async def test_unsigned_cookie_is_refused(jp_fetch, jp_serverapp):
     cookie = await complete_launch(jp_fetch)
     sid = s.session_id_from_cookie_header(cookie)
     assert jp_serverapp.web_app.settings["smart_session_store"].get(sid) is not None
-    r = await jp_fetch(session_path, headers={"Cookie": f"{COOKIE}={sid}"}, raise_error=False)
+    r = await jp_fetch(
+        session_path, headers={"Cookie": f"{COOKIE}={sid}"}, raise_error=False
+    )
     assert r.code == 403
 
 
 async def test_duplicate_session_cookie_is_refused(jp_fetch):
     cookie = await complete_launch(jp_fetch)
-    r = await jp_fetch(session_path, headers={"Cookie": f"{COOKIE}={'z' * 32}; {cookie}"}, raise_error=False)
+    r = await jp_fetch(
+        session_path,
+        headers={"Cookie": f"{COOKIE}={'z' * 32}; {cookie}"},
+        raise_error=False,
+    )
     assert r.code == 403
 
 
 async def test_logout_clears_cookie_with_matching_attributes(jp_fetch):
     cookie = await complete_launch(jp_fetch)
     r = await jp_fetch("logout", headers={"Cookie": cookie}, raise_error=False)
-    deletions = [h for h in r.headers.get_list("Set-Cookie") if h.startswith(f"{COOKIE}=;")]
-    assert len(deletions) == 1 and "Max-Age=0" in deletions[0] and "SameSite=Lax" in deletions[0]
+    deletions = [
+        h for h in r.headers.get_list("Set-Cookie") if h.startswith(f"{COOKIE}=;")
+    ]
+    assert (
+        len(deletions) == 1
+        and "Max-Age=0" in deletions[0]
+        and "SameSite=Lax" in deletions[0]
+    )
+    assert "HttpOnly" in deletions[0] and "Path=/" in deletions[0]
 
 
 async def test_session_query_arg_mismatch_is_refused(jp_fetch):
     cookie = await complete_launch(jp_fetch)
     sid = s.session_id_from_cookie_header(cookie)
-    ok = await jp_fetch(session_path, params={"smart_session": sid}, headers={"Cookie": cookie}, raise_error=False)
+    ok = await jp_fetch(
+        session_path,
+        params={"smart_session": sid},
+        headers={"Cookie": cookie},
+        raise_error=False,
+    )
     assert ok.code == 200
-    other = await jp_fetch(session_path, params={"smart_session": "q" * 32}, headers={"Cookie": cookie}, raise_error=False)
+    other = await jp_fetch(
+        session_path,
+        params={"smart_session": "q" * 32},
+        headers={"Cookie": cookie},
+        raise_error=False,
+    )
     assert other.code == 403  # a frame for another session fails closed
 
 
@@ -154,8 +208,12 @@ async def test_duplicate_session_query_arg_is_refused(jp_fetch):
     cookie = await complete_launch(jp_fetch)
     sid = s.session_id_from_cookie_header(cookie)
     params = [("smart_session", "q" * 32), ("smart_session", sid)]
-    r = await jp_fetch(session_path, params=params, headers={"Cookie": cookie}, raise_error=False)
-    assert r.code == 403  # a crafted next_url value must not be bypassed by ours appended after it
+    r = await jp_fetch(
+        session_path, params=params, headers={"Cookie": cookie}, raise_error=False
+    )
+    assert (
+        r.code == 403
+    )  # a crafted next_url value must not be bypassed by ours appended after it
 
 
 async def test_expired_session_is_refused_and_file_removed(jp_fetch, jp_serverapp):
@@ -164,7 +222,9 @@ async def test_expired_session_is_refused_and_file_removed(jp_fetch, jp_serverap
     sid = s.session_id_from_cookie_header(cookie)
     path = store.token_file(sid)
     assert path.exists()
-    assert (await jp_fetch(session_path, headers={"Cookie": cookie}, raise_error=False)).code == 200
+    assert (
+        await jp_fetch(session_path, headers={"Cookie": cookie}, raise_error=False)
+    ).code == 200
     exp = store._sessions[sid].expires_at  # capture BEFORE swapping the clock
     store.clock = lambda: exp + 1
     r = await jp_fetch(session_path, headers={"Cookie": cookie}, raise_error=False)
@@ -182,10 +242,24 @@ async def test_logout_ends_session(jp_fetch, jp_serverapp):
 
 async def test_authorizer_denies_api_surfaces_even_with_session(jp_fetch):
     cookie = await complete_launch(jp_fetch)
-    for path in (("api", "kernels"), ("api", "contents"), ("api", "sessions"), ("api", "kernelspecs")):
+    for path in (
+        ("api", "kernels"),
+        ("api", "contents"),
+        ("api", "sessions"),
+        ("api", "kernelspecs"),
+    ):
         r = await jp_fetch(*path, headers={"Cookie": cookie}, raise_error=False)
         assert r.code == 403, path
-    r = await jp_fetch("api", "kernels", method="POST", body="{}", headers={"Cookie": cookie}, raise_error=False)
+    r = await jp_fetch(
+        "api",
+        "kernels",
+        method="POST",
+        body="{}",
+        headers={"Cookie": cookie},
+        raise_error=False,
+    )
     assert r.code == 403
-    r = await jp_fetch("api", "terminals", headers={"Cookie": cookie}, raise_error=False)
+    r = await jp_fetch(
+        "api", "terminals", headers={"Cookie": cookie}, raise_error=False
+    )
     assert r.code in (403, 404)  # 404 when the terminals extension is not installed
