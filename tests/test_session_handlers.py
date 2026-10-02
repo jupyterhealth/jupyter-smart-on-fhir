@@ -2,12 +2,15 @@
 them (SMARTIdentityProvider, allow_unauthenticated_access=False). Discovery and the
 token exchange are faked; no SMART sandbox."""
 
+import asyncio
 import json
+import logging
 import os
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qsl, urlparse
 
 import pytest
+from tornado.web import create_signed_value
 from traitlets.config import Config
 
 from jupyter_smart_on_fhir import server_extension as ext
@@ -529,3 +532,127 @@ async def test_token_for_code_rejects_body_that_is_not_a_json_object(
     assert (
         r.code == 502 and "Relaunch" in r.body.decode()
     )  # unguarded, these were a 500
+
+
+async def test_token_for_code_does_not_follow_redirects(
+    jp_fetch, jp_serverapp, monkeypatch
+):
+    seen = []
+
+    class Reply:
+        body = b'{"access_token": "AT", "token_type": "Bearer"}'
+
+    class FakeClient:
+        async def fetch(self, url, **kwargs):
+            seen.append((url, kwargs))
+            return Reply()
+
+    monkeypatch.setattr(ext, "AsyncHTTPClient", FakeClient)
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    assert r.code == 302, r.body
+    ((url, kwargs),) = seen
+    assert url == "https://ehr.example/token"
+    assert kwargs["follow_redirects"] is False  # a redirect could downgrade off TLS
+
+
+async def test_callback_sets_xsrf_cookie_for_voila_shutdown_beacon(
+    jp_fetch, fake_token_exchange
+):
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg)
+    assert r.code == 302
+    assert any(h.startswith("_xsrf=") for h in r.headers.get_list("Set-Cookie"))
+
+
+async def test_concurrent_callbacks_exchange_the_code_once(jp_fetch, monkeypatch):
+    calls = []
+    release = asyncio.Event()
+
+    async def token_for_code(self, code, code_verifier, token_url):
+        calls.append(code)
+        await release.wait()
+        return {"access_token": "AT", "token_type": "Bearer", "expires_in": 900}
+
+    monkeypatch.setattr(SMARTCallbackHandler, "token_for_code", token_for_code)
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    first = asyncio.ensure_future(do_callback(jp_fetch, l, lg))
+    second = asyncio.ensure_future(do_callback(jp_fetch, l, lg))
+    # the loser must be refused while the winner is still mid-exchange
+    await asyncio.wait({first, second}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+    release.set()
+    codes = sorted(r.code for r in await asyncio.gather(first, second))
+    assert codes == [302, 400]
+    assert calls == ["C1"]
+
+
+@pytest.mark.parametrize(
+    "iss", [ISS + "?x=1", ISS + "#frag", ISS + ";p", "https://ehr.example/fh?ir"]
+)
+async def test_launch_rejects_issuer_with_query_fragment_or_params(
+    jp_fetch, fake_discovery, iss
+):
+    r = await launch(jp_fetch, iss=iss)
+    assert r.code == 400
+    assert fake_discovery == []
+
+
+@pytest.mark.parametrize("field", ["token_endpoint", "authorization_endpoint"])
+async def test_launch_rejects_plain_http_smart_endpoints(jp_fetch, monkeypatch, field):
+    async def fetch_discovery_document(iss, timeout):
+        doc = {
+            "token_endpoint": "https://ehr.example/token",
+            "authorization_endpoint": "https://ehr.example/authorize",
+        }
+        doc[field] = doc[field].replace("https://", "http://")
+        return doc
+
+    monkeypatch.setattr(ext, "fetch_discovery_document", fetch_discovery_document)
+    r = await launch(jp_fetch)
+    assert r.code == 502
+
+
+def test_localhost_http_smart_endpoints_are_allowed():
+    cfg = ext.config_from_document(
+        {
+            "token_endpoint": "http://localhost:8103/token",
+            "authorization_endpoint": "http://127.0.0.1:8103/authorize",
+        },
+        "http://localhost:8103/fhir",
+        "http://localhost:8888/",
+    )
+    assert cfg.token_url == "http://localhost:8103/token"
+
+
+async def test_refused_launch_does_not_log_launch_value(jp_fetch, caplog):
+    caplog.set_level(logging.DEBUG)
+    r = await launch(jp_fetch, iss="https://attacker.example/fhir", launch="SECRET123")
+    assert r.code == 400
+    assert "not an allowed EHR issuer" in caplog.text  # the error itself is logged
+    assert "SECRET123" not in caplog.text
+
+
+async def test_callback_state_mismatch_does_not_log_state(
+    jp_fetch, fake_token_exchange, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    l = await launch(jp_fetch)
+    lg = await do_login(jp_fetch, l)
+    r = await do_callback(jp_fetch, l, lg, state="STATEVALUE987")
+    assert r.code == 400
+    assert "does not match" in caplog.text
+    assert "STATEVALUE987" not in caplog.text
+
+
+async def test_login_with_cookie_signed_by_another_secret_is_400_relaunch(jp_fetch):
+    l = await launch(jp_fetch)
+    sid = s.session_id_from_cookie_header(cookie_header(l))
+    jar = SimpleCookie()
+    jar[COOKIE] = create_signed_value("other-secret", COOKIE, sid).decode()
+    r = await do_login(jp_fetch, l, cookie=f"{COOKIE}={jar[COOKIE].coded_value}")
+    assert r.code == 400
+    body = r.body.decode()
+    assert "Relaunch from the EHR" in body and "open in a new window" not in body

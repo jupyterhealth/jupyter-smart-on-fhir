@@ -1,8 +1,9 @@
+import asyncio
 import json
 import os
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 
 from jupyter_core.paths import jupyter_runtime_dir
 from jupyter_server.auth.authorizer import Authorizer
@@ -200,6 +201,7 @@ class SMARTExtensionApp(ExtensionApp):
             pending_lifetime=self.pending_lifetime,
             session_lifetime=self.session_lifetime,
             max_pending=self.max_pending_sessions,
+            on_delete=self._shutdown_session_kernels,
         )
         store.wipe()  # no session survives a restart
         os.environ[TOKEN_DIR_ENV] = self.token_dir
@@ -209,6 +211,12 @@ class SMARTExtensionApp(ExtensionApp):
         self.settings["smart_session_cookie_name"] = self.cookie_name
         self.settings["smart_allowed_issuers"] = allowed
         self.settings["smart_discovery_cache"] = {}
+        # jupyter_server's access log already scrubs code/state; launch and smart_session too.
+        self.settings["extra_log_scrub_param_keys"] = [
+            *self.settings.get("extra_log_scrub_param_keys", []),
+            "launch",
+            "smart_session",
+        ]
         if not allowed:
             self.log.warning(
                 "SMARTExtensionApp.allowed_issuers is empty: any logged-in Jupyter user "
@@ -226,6 +234,23 @@ class SMARTExtensionApp(ExtensionApp):
                 )
             else:
                 os.environ["SMART_TOKEN_FILE"] = self.token_file
+
+    def _shutdown_session_kernels(self, session_id: str) -> None:
+        """Reap the kernels Voilà started for a session that relaunched, logged out or expired."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no server loop (store used directly): nothing to schedule on
+        km = self.serverapp.kernel_manager
+        for kid in list(km.list_kernel_ids()):
+            if _kernel_session_id(km, kid, self.cookie_name) != session_id:
+                continue
+            self.log.info(
+                "shutting down kernel %s of ended SMART session %s",
+                kid,
+                session_id[:8],
+            )
+            loop.create_task(km.shutdown_kernel(kid, now=True))
 
     def initialize_handlers(self):
         self.handlers.extend(
@@ -269,6 +294,9 @@ def normalize_issuer(url: str) -> str:
     # urlparse silently drops tabs/newlines, so reject them before parsing.
     if any(c in (url or "") for c in "\t\r\n"):
         raise ValueError(f"issuer contains control characters: {url!r}")
+    # A FHIR base URL has no query/fragment/params; they would only yield allowlist aliases.
+    if any(c in (url or "") for c in "?#;"):
+        raise ValueError(f"issuer must not contain '?', '#' or ';': {url!r}")
     url = (url or "").strip().rstrip("/")
     parts = urlparse(url)
     if not parts.scheme or not parts.netloc:
@@ -332,13 +360,26 @@ async def fetch_discovery_document(iss: str, timeout: float) -> dict:
     return json.loads(reply.body.decode("utf8", "replace"))
 
 
+def _require_tls_endpoint(url) -> str:
+    """The code and PKCE verifier travel to these endpoints, so plain http only for localhost."""
+    parts = urlparse(url) if isinstance(url, str) else None
+    if parts is None or not parts.netloc:
+        raise ValueError(f"SMART endpoint must be an absolute URL: {url!r}")
+    if parts.scheme.lower() != "https" and parts.hostname not in (
+        "localhost",
+        "127.0.0.1",
+    ):
+        raise ValueError(f"SMART endpoint must be https: {url!r}")
+    return url
+
+
 def config_from_document(cfg: dict, iss: str, base_url: str) -> SMARTConfig:
     """`iss` is kept as this launch sent it: SMART requires `aud` to equal that value."""
     return SMARTConfig(
         base_url=base_url,
         fhir_url=iss,
-        token_url=cfg["token_endpoint"],
-        auth_url=cfg["authorization_endpoint"],
+        token_url=_require_tls_endpoint(cfg["token_endpoint"]),
+        auth_url=_require_tls_endpoint(cfg["authorization_endpoint"]),
         smart_config=cfg,
     )
 
@@ -440,6 +481,44 @@ def require_session(handler) -> SMARTSession:
     raise web.HTTPError(400, LAUNCH_EXPIRED_MESSAGE)
 
 
+_SCRUBBED_PARAMS = ("launch", "code", "state", "smart_session")
+
+try:
+    from jupyter_server.log import _scrub_uri
+except ImportError:  # private helper; keep a local equivalent if it moves
+
+    def _scrub_uri(uri: str, extra_param_keys=None) -> str:
+        keys = set(_SCRUBBED_PARAMS) | set(extra_param_keys or [])
+        parsed = urlparse(uri)
+        if not parsed.query:
+            return uri
+        parts = []
+        for part in parsed.query.split("&"):
+            key, sep, _ = part.partition("=")
+            parts.append(f"{key}{sep}[secret]" if key in keys else part)
+        return urlunparse(parsed._replace(query="&".join(parts)))
+
+
+class _ScrubbedLogMixin:
+    """tornado logs the full request URI on HTTPError; the launch, code, state and
+    session values in it are credentials, so log a scrubbed URI instead."""
+
+    def log_exception(self, typ, value, tb):
+        if not isinstance(value, web.HTTPError):
+            return super().log_exception(typ, value, tb)
+        message = value.log_message
+        if message and value.args:
+            message = message % value.args
+        if message:
+            self.log.warning(
+                "%d %s %s: %s",
+                value.status_code,
+                self.request.method,
+                _scrub_uri(self.request.uri, _SCRUBBED_PARAMS),
+                message,
+            )
+
+
 def is_smart_idp(handler) -> bool:
     return isinstance(handler.identity_provider, SMARTIdentityProvider)
 
@@ -458,7 +537,7 @@ def require_jupyter_user_unless_smart_idp(handler) -> None:
     raise web.HTTPError(403)
 
 
-class SMARTLaunchHandler(JupyterHandler):
+class SMARTLaunchHandler(_ScrubbedLogMixin, JupyterHandler):
     """Entry point the EHR redirects to. Checks the issuer allowlist before anything
     else, mints a fresh session for this browser, and hands off to the login handler."""
 
@@ -527,7 +606,7 @@ class SMARTLaunchHandler(JupyterHandler):
         )
 
 
-class SMARTLoginHandler(JupyterHandler):
+class SMARTLoginHandler(_ScrubbedLogMixin, JupyterHandler):
     """Builds the EHR authorize URL with state/PKCE stored on this browser's session."""
 
     @allow_unauthenticated
@@ -558,7 +637,7 @@ class SMARTLoginHandler(JupyterHandler):
         self.redirect(url_concat(smart_config.auth_url, oauth_params))
 
 
-class SMARTCallbackHandler(JupyterHandler):
+class SMARTCallbackHandler(_ScrubbedLogMixin, JupyterHandler):
     """OAuth redirect target: validates state against this browser's session only."""
 
     async def token_for_code(
@@ -577,7 +656,11 @@ class SMARTCallbackHandler(JupyterHandler):
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         try:
             token_reply = await AsyncHTTPClient().fetch(
-                token_url, body=urlencode(data), headers=headers, method="POST"
+                token_url,
+                body=urlencode(data),
+                headers=headers,
+                method="POST",
+                follow_redirects=False,
             )
         except HTTPClientError as e:
             # e.response is None on timeouts/connection errors; never dereference blindly
@@ -638,6 +721,8 @@ class SMARTCallbackHandler(JupyterHandler):
                 502, "Could not obtain a token from the EHR. Relaunch from the EHR."
             )
         self.log.info("SMART session %s authenticated", session.session_id[:8])
+        # Voilà's unload beacon POSTs the _xsrf cookie; tornado only sets it when the property is read.
+        self.xsrf_token
 
         smart_auth = self.settings["smart_auth"]
         if smart_auth.persist_global_token and not is_smart_idp(self):
@@ -688,7 +773,7 @@ class SMARTNotLaunchedHandler(JupyterHandler):
         self.finish(NOT_LAUNCHED_HTML)
 
 
-class SMARTSessionInfoHandler(JupyterHandler):
+class SMARTSessionInfoHandler(_ScrubbedLogMixin, JupyterHandler):
     """Cheap authenticated probe: lets a page confirm its cookie works and tests
     confirm identity without going through the authorizer-guarded API."""
 
@@ -757,24 +842,31 @@ def clear_session_cookie(handler) -> None:
     handler.add_header("Set-Cookie", header)
 
 
-def kernel_session_id(handler, kernel_id: str) -> str | None:
+def _kernel_session_id(kernel_manager, kernel_id: str, cookie_name: str) -> str | None:
     """Session that started this kernel, read from the Cookie header Voilà put in its env."""
     try:
-        km = handler.kernel_manager.get_kernel(kernel_id)
+        km = kernel_manager.get_kernel(kernel_id)
     except Exception:
         return None
     env = (getattr(km, "_launch_args", None) or {}).get("env") or {}
-    return session_id_from_cookie_header(
-        env.get("HTTP_COOKIE"),
+    return session_id_from_cookie_header(env.get("HTTP_COOKIE"), cookie_name)
+
+
+def kernel_session_id(handler, kernel_id: str) -> str | None:
+    return _kernel_session_id(
+        handler.kernel_manager,
+        kernel_id,
         handler.settings.get("smart_session_cookie_name", SESSION_COOKIE_NAME),
     )
 
 
 class SMARTAuthorizer(Authorizer):
-    """A SMART session may only talk to the kernel Voilà started for it. Everything
-    else in the Jupyter API (contents, terminals, sessions, kernel listing/creation,
-    kernelspecs, config, ...) is denied. Voilà's render and shutdown routes are not
-    authorizer-guarded, so rendering is unaffected."""
+    """Governs only the resources jupyter_server checks through the authorizer
+    (@authorized handlers and the kernel websocket): a SMART session may read/execute
+    on the kernel Voilà started for it and nothing else (contents, terminals, sessions,
+    kernel listing/creation, kernelspecs, config, ... are denied). Voilà's own render
+    and shutdown routes and /metrics only require a logged-in user; this authorizer
+    does not guard them."""
 
     def is_authorized(self, handler, user, action, resource):
         if resource != "kernels" or action not in ("execute", "read"):

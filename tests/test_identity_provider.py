@@ -1,12 +1,14 @@
 """With SMARTIdentityProvider, only a browser holding an authenticated session is a user:
 page handlers redirect to /login (a 403 page), API handlers 403 directly."""
 
+import asyncio
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qsl, urlparse
 
 import pytest
 from tornado.httpclient import HTTPRequest
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
+from tornado.web import create_signed_value
 from traitlets.config import Config
 
 from jupyter_smart_on_fhir import server_extension as ext
@@ -263,3 +265,53 @@ async def test_authorizer_denies_api_surfaces_even_with_session(jp_fetch):
         "api", "terminals", headers={"Cookie": cookie}, raise_error=False
     )
     assert r.code in (403, 404)  # 404 when the terminals extension is not installed
+
+
+async def test_cookie_signed_with_another_secret_is_refused(jp_fetch):
+    cookie = await complete_launch(jp_fetch)
+    sid = s.session_id_from_cookie_header(cookie)
+    jar = SimpleCookie()
+    jar[COOKIE] = create_signed_value("other-secret", COOKIE, sid).decode()
+    r = await jp_fetch(
+        session_path,
+        headers={"Cookie": f"{COOKIE}={jar[COOKIE].coded_value}"},
+        raise_error=False,
+    )
+    assert r.code == 403
+
+
+async def test_relaunch_shuts_down_kernels_of_the_ended_session(
+    jp_fetch, jp_serverapp, monkeypatch
+):
+    first = await complete_launch(jp_fetch)
+    other = await complete_launch(jp_fetch)
+
+    class FakeKernel:
+        def __init__(self, cookie):
+            self._launch_args = {"env": {"HTTP_COOKIE": cookie}}
+
+    class FakeKernelManager:
+        kernels = {"k-first": FakeKernel(first), "k-other": FakeKernel(other)}
+        shut_down = []
+
+        def list_kernel_ids(self):
+            return list(self.kernels)
+
+        def get_kernel(self, kid):
+            return self.kernels[kid]
+
+        async def shutdown_kernel(self, kid, now=False):
+            self.shut_down.append((kid, now))
+
+    fake = FakeKernelManager()
+    monkeypatch.setattr(jp_serverapp, "kernel_manager", fake)
+    r = await jp_fetch(
+        launch_path,
+        params={"iss": ISS, "launch": "L2"},
+        headers={"Cookie": first},
+        follow_redirects=False,
+        raise_error=False,
+    )
+    assert r.code == 302
+    await asyncio.sleep(0)  # let the scheduled shutdown task run
+    assert fake.shut_down == [("k-first", True)]

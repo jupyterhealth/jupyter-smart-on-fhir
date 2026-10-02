@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import math
 import os
 import re
 import secrets
@@ -23,6 +25,8 @@ TOKEN_DIR_ENV = "SMART_TOKEN_DIR"
 COOKIE_NAME_ENV = "SMART_COOKIE_NAME"
 COOKIE_HEADER_ENV = "HTTP_COOKIE"
 SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+log = logging.getLogger(__name__)
 
 
 class SMARTSessionError(Exception):
@@ -52,6 +56,7 @@ class SMARTSessionStore:
         session_lifetime: int = 3600,
         max_pending: int = 500,
         clock: Callable[[], float] = time.time,
+        on_delete: Callable[[str], None] | None = None,
     ):
         self.token_dir = Path(token_dir)
         self.token_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -60,6 +65,7 @@ class SMARTSessionStore:
         self.session_lifetime = session_lifetime
         self.max_pending = max_pending
         self.clock = clock
+        self.on_delete = on_delete
         self._sessions: dict[str, SMARTSession] = {}
 
     def create(self, fhir_url: str, smart_config: Any) -> SMARTSession:
@@ -112,7 +118,12 @@ class SMARTSessionStore:
             raise SMARTSessionError("Token response token_type is not bearer")
         lifetime = self.session_lifetime
         expires_in = token_response.get("expires_in")
-        if isinstance(expires_in, (int, float)) and expires_in > 0:
+        if (
+            isinstance(expires_in, (int, float))
+            and not isinstance(expires_in, bool)
+            and math.isfinite(expires_in)
+            and expires_in > 0
+        ):
             lifetime = min(lifetime, int(expires_in))
         expires_at = self.clock() + lifetime
         smart_config = getattr(sess.smart_config, "smart_config", sess.smart_config)
@@ -132,11 +143,17 @@ class SMARTSessionStore:
         return sess
 
     def delete(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
+        existed = self._sessions.pop(session_id, None) is not None
         try:
             self.token_file(session_id).unlink()
         except (FileNotFoundError, SMARTSessionError):
             pass
+        if existed and self.on_delete is not None:
+            try:
+                self.on_delete(session_id)
+            except Exception:
+                # a cleanup hook must never keep a session alive
+                log.exception("SMART session on_delete hook failed")
 
     def purge_expired(self) -> int:
         now = self.clock()

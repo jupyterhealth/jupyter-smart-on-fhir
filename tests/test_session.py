@@ -166,6 +166,44 @@ def test_delete_removes_session_and_file(store):
     assert not store.token_file(sess.session_id).exists()
 
 
+@pytest.mark.parametrize("expires_in", [float("inf"), float("nan"), True])
+def test_complete_ignores_non_finite_or_bool_expires_in(store, clock, expires_in):
+    sess = store.create("https://ehr.example/fhir", FakeSmartConfig())
+    store.complete(
+        sess.session_id,
+        {"access_token": "AT", "token_type": "bearer", "expires_in": expires_in},
+    )
+    assert sess.expires_at == clock.now + store.session_lifetime
+
+
+def test_on_delete_hook_called_on_delete_and_purge(tmp_path, clock):
+    ended = []
+    store = s.SMARTSessionStore(
+        tmp_path / "sessions", clock=clock, on_delete=ended.append
+    )
+    a = store.create("https://ehr.example/fhir", FakeSmartConfig())
+    b = store.create("https://ehr.example/fhir", FakeSmartConfig())
+    store.delete(a.session_id)
+    assert ended == [a.session_id]
+    clock.now += store.pending_lifetime + 1
+    assert store.purge_expired() == 1
+    assert ended == [a.session_id, b.session_id]
+    store.delete(a.session_id)  # already gone: no second notification
+    assert ended == [a.session_id, b.session_id]
+
+
+def test_raising_on_delete_hook_does_not_break_deletion(tmp_path, clock):
+    def boom(session_id):
+        raise RuntimeError("kernel manager gone")
+
+    store = s.SMARTSessionStore(tmp_path / "sessions", clock=clock, on_delete=boom)
+    sess = store.create("https://ehr.example/fhir", FakeSmartConfig())
+    store.complete(sess.session_id, {"access_token": "AT", "token_type": "bearer"})
+    store.delete(sess.session_id)
+    assert store.get(sess.session_id) is None
+    assert not store.token_file(sess.session_id).exists()
+
+
 def test_wipe_removes_stale_files_from_disk(tmp_path, clock):
     d = tmp_path / "sessions"
     d.mkdir()
