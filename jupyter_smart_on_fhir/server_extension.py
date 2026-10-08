@@ -96,7 +96,7 @@ class SMARTIdentityProvider(IdentityProvider):
             self.log.exception("Failed to decode id token")
             return None
         else:
-            username = id_token["fhirUser"]
+            username = id_token["sub"]
         return SMARTTokenUser(username=username, smart_token=token)
 
     def user_to_cookie(self, user: SMARTTokenUser):
@@ -370,7 +370,7 @@ class SMARTCallbackHandler(JupyterHandler):
         if isinstance(identity_provider, SMARTIdentityProvider):
             smart_token = token_response["access_token"]
             id_token = jwt.decode(smart_token, options={"verify_signature": False})
-            username = id_token["fhirUser"]
+            username = id_token["sub"]
             user = SMARTTokenUser(username=username, smart_token=smart_token)
             identity_provider.set_login_cookie(self, user)
 
