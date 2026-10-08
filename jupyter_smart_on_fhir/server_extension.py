@@ -2,6 +2,7 @@ import json
 import os
 from dataclasses import dataclass
 from functools import wraps
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
 
@@ -61,6 +62,19 @@ class SMARTTokenUser(User):
     )
 
 
+def _username_from_token(token: str, log) -> str | None:
+    try:
+        id_token = jwt.decode(token, options={"verify_signature": False})
+    except Exception as e:
+        log.exception("Failed to decode id token")
+        return None
+    for key in ["fhirUser", "profile", "sub"]:
+        if key in id_token:
+            return id_token[key]
+    # fallback on sha of token itself
+    return f"sha-{sha256(token.encode()).hexdigest()[:7]}"
+
+
 class SMARTIdentityProvider(IdentityProvider):
     """
     IdentityProvider that users SMART launch itself for auth.
@@ -90,13 +104,9 @@ class SMARTIdentityProvider(IdentityProvider):
             self.log.warning("Not accepting mismatched SMART token")
             return None
 
-        try:
-            id_token = jwt.decode(token, options={"verify_signature": False})
-        except Exception as e:
-            self.log.exception("Failed to decode id token")
+        username = _username_from_token(token, log=self.log)
+        if username is None:
             return None
-        else:
-            username = id_token["sub"]
         return SMARTTokenUser(username=username, smart_token=token)
 
     def user_to_cookie(self, user: SMARTTokenUser):
@@ -369,8 +379,9 @@ class SMARTCallbackHandler(JupyterHandler):
         identity_provider = self.settings["identity_provider"]
         if isinstance(identity_provider, SMARTIdentityProvider):
             smart_token = token_response["access_token"]
-            id_token = jwt.decode(smart_token, options={"verify_signature": False})
-            username = id_token["sub"]
+            username = _username_from_token(smart_token, log=identity_provider.log)
+            if not username:
+                raise RuntimeError("Failed to get username!")
             user = SMARTTokenUser(username=username, smart_token=smart_token)
             identity_provider.set_login_cookie(self, user)
 
